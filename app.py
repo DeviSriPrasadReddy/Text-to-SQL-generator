@@ -1,16 +1,12 @@
 import dash
-from dash import html, dcc, Input, Output, State, callback, ALL, MATCH, callback_context, no_update, clientside_callback, dash_table
+from dash import html, dcc, Input, Output, State, MATCH, callback_context, no_update, dash_table
 import dash_bootstrap_components as dbc
 import pandas as pd
-import json
 import logging
 import uuid
-import os
-import flask
 from dotenv import load_dotenv
 
 # --- IMPORT BACKEND LOGIC ---
-# This imports the routing and execution logic we defined earlier
 from genie_backend import execute_genie_query, route_question, generate_insights, SPACE_CONFIG
 
 # --- SETUP ---
@@ -26,7 +22,6 @@ app = dash.Dash(
 server = app.server
 
 # --- CUSTOM STYLES ---
-# We inject CSS to make the chat bubbles look modern
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -36,14 +31,14 @@ app.index_string = '''
         {%favicon%}
         {%css%}
         <style>
-            .chat-container { height: 80vh; display: flex; flex-direction: column; }
+            .chat-container { height: 90vh; display: flex; flex-direction: column; }
             .chat-window { flex-grow: 1; overflow-y: auto; padding: 20px; background: #f8f9fa; border-radius: 8px; margin-bottom: 15px; border: 1px solid #dee2e6; }
             .message { margin-bottom: 15px; padding: 10px 15px; border-radius: 15px; max-width: 80%; position: relative; }
             .user-message { background-color: #007bff; color: white; align-self: flex-end; margin-left: auto; border-bottom-right-radius: 2px; }
             .bot-message { background-color: #ffffff; color: #333; align-self: flex-start; margin-right: auto; border: 1px solid #e9ecef; border-bottom-left-radius: 2px; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
             .route-badge { font-size: 0.7rem; font-weight: bold; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 4px; display: block; color: #6c757d; }
             .insight-box { background: #f0f7ff; border-left: 4px solid #007bff; padding: 10px; margin-top: 10px; font-size: 0.9rem; }
-            .typing-indicator { font-style: italic; color: #888; font-size: 0.8rem; margin-left: 10px; }
+            .typing-indicator { font-style: italic; color: #888; font-size: 0.8rem; margin-left: 10px; min-height: 20px;}
         </style>
     </head>
     <body>
@@ -95,14 +90,10 @@ app.layout = dbc.Container([
         ], width=9)
     ], className="chat-container"),
 
-    # --- STORES (State Management) ---
-    # Stores the chat history list: [{role: 'user', content: '...'}, ...]
+    # --- STORES ---
     dcc.Store(id="chat-history", data=[]),
-    # Stores the mapping: {'space_id_1': 'conv_id_A', 'space_id_2': 'conv_id_B'}
     dcc.Store(id="session-map", data={}),
-    # Trigger for the backend query
     dcc.Store(id="backend-trigger", data=None),
-    # Dummy output for clientside callbacks
     html.Div(id="dummy-div", style={"display": "none"})
 
 ], fluid=True, style={"height": "100vh", "padding": "20px"})
@@ -135,8 +126,7 @@ def render_chat_message(msg):
                      page_size=5,
                      style_cell={'textAlign': 'left', 'fontSize': '12px'}
                  ))
-                 # Add "Generate Insights" Button for this specific message
-                 # We use a deterministic ID based on content hash or length to be simple
+                 # Add "Generate Insights" Button
                  btn_id = {"type": "insight-btn", "index": str(uuid.uuid4())}
                  children.append(dbc.Button("✨ Generate Insights", id=btn_id, size="sm", color="info", outline=True, className="mt-2"))
                  children.append(html.Div(id={"type": "insight-target", "index": btn_id["index"]}))
@@ -167,7 +157,7 @@ def render_chat_message(msg):
     [Input("send-btn", "n_clicks"),
      Input("user-input", "n_submit"),
      Input("reset-btn", "n_clicks"),
-     Input("backend-trigger", "data")], # Listen to itself for the 2-step process
+     Input("backend-trigger", "data")], 
     [State("user-input", "value"),
      State("chat-history", "data"),
      State("session-map", "data")],
@@ -189,20 +179,20 @@ def manage_chat(n_clicks, n_submit, n_reset, trigger_data,
 
     # CASE B: USER SUBMITS TEXT (Step 1)
     if trigger_id in ["send-btn", "user-input"] and user_text:
-        # 1. Append User Message
         history.append({"role": "user", "content": user_text})
         
-        # 2. Determine Routing immediately
+        # Determine Routing
         space_id = route_question(user_text)
         
-        # 3. Trigger Backend (Step 2 will pick this up)
+        # Trigger Backend
+        space_config_entry = next((v for k, v in SPACE_CONFIG.items() if v["id"] == space_id), {"label": "Unknown"})
+        
         next_trigger = {
             "text": user_text,
             "space_id": space_id,
-            "space_label": "Finance" if space_id == SPACE_CONFIG["FINANCE"]["id"] else "HR"
+            "space_label": space_config_entry["label"]
         }
         
-        # Render partial history + Loading indicator
         ui_messages = [render_chat_message(m) for m in history]
         
         return (ui_messages, "", history, next_trigger, 
@@ -214,21 +204,16 @@ def manage_chat(n_clicks, n_submit, n_reset, trigger_data,
         space_id = trigger_data["space_id"]
         space_label = trigger_data["space_label"]
         
-        # 1. Get existing Conversation ID
         current_conv_id = session_map.get(space_id)
         
-        # 2. EXECUTE QUERY (With Timeout handled in backend)
-        # Note: This blocks the worker, but Dash handles this okay for single users.
-        # For scale, use Celery/BackgroundCallback.
+        # EXECUTE QUERY
         new_conv_id, result_raw, sql_query = execute_genie_query(user_query, space_id, current_conv_id)
         
-        # 3. Process Result
+        # Process Result
         content_to_store = result_raw
         if isinstance(result_raw, pd.DataFrame):
-            # Serialize DF to JSON for storage
             content_to_store = result_raw.to_json(orient='split')
             
-        # 4. Update History
         history.append({
             "role": "assistant",
             "content": content_to_store,
@@ -236,17 +221,14 @@ def manage_chat(n_clicks, n_submit, n_reset, trigger_data,
             "sql": sql_query
         })
         
-        # 5. Update Session Map
         if new_conv_id:
             session_map[space_id] = new_conv_id
             
-        # 6. Update UI
         ui_messages = [render_chat_message(m) for m in history]
         
-        # 7. Update Sidebar List
         active_sessions = []
         for sid, cid in session_map.items():
-            label = "Finance" if sid == SPACE_CONFIG["FINANCE"]["id"] else "HR"
+            label = next((v["label"] for k, v in SPACE_CONFIG.items() if v["id"] == sid), "Genie Space")
             active_sessions.append(html.Div([
                 html.Span("● ", style={"color": "green"}),
                 html.Span(f"{label}: "),
@@ -256,6 +238,7 @@ def manage_chat(n_clicks, n_submit, n_reset, trigger_data,
         return (ui_messages, no_update, history, None, "", session_map, active_sessions)
 
     return no_update
+
 
 # --- CALLBACK 2: GENERATE INSIGHTS ---
 @app.callback(
@@ -267,8 +250,6 @@ def manage_chat(n_clicks, n_submit, n_reset, trigger_data,
 def show_insights(n_clicks, history):
     if not n_clicks: return no_update
     
-    # In a real app, you'd traverse history to find the exact DF associated with this button.
-    # For simplicity, we grab the LAST dataframe found in history.
     last_df_content = None
     for msg in reversed(history):
         if msg["role"] == "assistant" and isinstance(msg["content"], str) and "columns" in msg["content"]:
@@ -277,13 +258,13 @@ def show_insights(n_clicks, history):
             
     if last_df_content:
         df = pd.read_json(last_df_content, orient='split')
-        insight_text = generate_insights(df) # From backend
+        insight_text = generate_insights(df)
         return html.Div(dcc.Markdown(insight_text), className="insight-box")
     
     return html.Div("No data found to analyze.", className="text-danger")
 
+
 # --- CLIENTSIDE: AUTO-SCROLL ---
-# Ensures the chat window always scrolls to the bottom when new messages arrive
 app.clientside_callback(
     """
     function(children) {
