@@ -1,37 +1,19 @@
+import requests
 import pandas as pd
 import time
-import requests
-import os
-from dotenv import load_dotenv
-from typing import Dict, Any, Optional, List, Union, Tuple
 import logging
 import backoff
+from typing import Dict, Any, Optional, Tuple, Union
 
-# Configure Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-load_dotenv()
-
-# --- CONFIGURATION ---
-DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
-DATABRICKS_TOKEN = os.environ.get("DATABRICKS_TOKEN")
-
-# Define Space Configs (Load from env or hardcode)
-SPACE_CONFIG = {
-    "FINANCE": {"id": os.environ.get("SPACE_ID_FINANCE", "default_finance_id"), "label": "Finance"},
-    "HR": {"id": os.environ.get("SPACE_ID_HR", "default_hr_id"), "label": "Human Resources"}
-}
-
-if not DATABRICKS_TOKEN:
-    raise ValueError("DATABRICKS_TOKEN is missing from environment variables.")
 
 # --- CLIENT CLASS ---
 class GenieClient:
     def __init__(self, host: str, space_id: str, user_token: str):
         self.host = host
         self.space_id = space_id
-        # STRICTLY use the user token provided
+        # Token is injected from app.py logic
         self.user_token = user_token
         self.base_url = f"https://{host}/api/2.0/genie/spaces/{space_id}"
         self.headers = {
@@ -39,7 +21,7 @@ class GenieClient:
             "Content-Type": "application/json"
         }
 
-    @backoff.on_exception(backoff.expo, Exception, max_tries=3, factor=2)
+    @backoff.on_exception(backoff.expo, Exception, max_tries=3)
     def start_conversation(self, question: str) -> Dict[str, Any]:
         url = f"{self.base_url}/start-conversation"
         payload = {"content": question}
@@ -47,7 +29,7 @@ class GenieClient:
         response.raise_for_status()
         return response.json()
 
-    @backoff.on_exception(backoff.expo, Exception, max_tries=3, factor=2)
+    @backoff.on_exception(backoff.expo, Exception, max_tries=3)
     def send_message(self, conversation_id: str, message: str) -> Dict[str, Any]:
         url = f"{self.base_url}/conversations/{conversation_id}/messages"
         payload = {"content": message}
@@ -55,128 +37,95 @@ class GenieClient:
         response.raise_for_status()
         return response.json()
 
-    @backoff.on_exception(backoff.expo, Exception, max_tries=3, factor=2)
     def get_message(self, conversation_id: str, message_id: str) -> Dict[str, Any]:
         url = f"{self.base_url}/conversations/{conversation_id}/messages/{message_id}"
         response = requests.get(url, headers=self.headers)
         response.raise_for_status()
         return response.json()
 
-    @backoff.on_exception(backoff.expo, Exception, max_tries=3, factor=2)
     def get_query_result(self, conversation_id: str, message_id: str, attachment_id: str) -> Dict[str, Any]:
         url = f"{self.base_url}/conversations/{conversation_id}/messages/{message_id}/attachments/{attachment_id}/query-result"
         response = requests.get(url, headers=self.headers)
         response.raise_for_status()
-        result = response.json()
-        
-        data_array = result.get('statement_response', {}).get('result', {}).get('data_array', [])
-        schema = result.get('statement_response', {}).get('manifest', {}).get('schema', {})
-        return {'data_array': data_array, 'schema': schema}
+        return response.json()
 
-    def wait_for_message_completion(self, conversation_id: str, message_id: str, timeout: int = 300) -> Dict[str, Any]:
-        start_time = time.time()
-        poll_interval = 2
-        
-        while time.time() - start_time < timeout:
-            try:
-                message = self.get_message(conversation_id, message_id)
-                status = message.get("status")
-                if status in ["COMPLETED", "ERROR", "FAILED"]:
-                    return message
-            except Exception as e:
-                logger.warning(f"Transient polling error: {e}")
-            
-            time.sleep(poll_interval)
-            
-        raise TimeoutError(f"Genie did not respond within {timeout} seconds.")
+    def wait_for_completion(self, conversation_id: str, message_id: str, timeout: int = 120) -> Dict[str, Any]:
+        start = time.time()
+        while time.time() - start < timeout:
+            msg = self.get_message(conversation_id, message_id)
+            if msg.get("status") in ["COMPLETED", "FAILED", "ERROR"]:
+                return msg
+            time.sleep(2)
+        raise TimeoutError("Genie request timed out.")
 
-# --- CORE LOGIC ---
-
-def process_genie_response(client: GenieClient, conversation_id: str, message_id: str, complete_message: Dict[str, Any]) -> Tuple[Union[str, pd.DataFrame], Optional[str]]:
-    attachments = complete_message.get("attachments", [])
-    for attachment in attachments:
-        attachment_id = attachment.get("attachment_id")
-        
-        # Handle Text Response
-        if "text" in attachment and "content" in attachment["text"]:
-            return attachment["text"]["content"], None
-            
-        # Handle SQL/Data Response
-        elif "query" in attachment:
-            query_text = attachment.get("query", {}).get("query", "")
-            try:
-                query_result = client.get_query_result(conversation_id, message_id, attachment_id)
-                data_array = query_result.get('data_array', [])
-                schema = query_result.get('schema', {})
-                columns = [col.get('name') for col in schema.get('columns', [])]
-                
-                if data_array:
-                    if not columns:
-                        columns = [f"col_{i}" for i in range(len(data_array[0]))]
-                    df = pd.DataFrame(data_array, columns=columns)
-                    return df, query_text
-            except Exception as e:
-                logger.error(f"Error fetching query result: {e}")
-                return "Error retrieving data.", query_text
+# --- PARSING LOGIC ---
+def extract_genie_data(client: GenieClient, conv_id: str, msg_id: str, message: Dict) -> Tuple[Any, Optional[str]]:
+    """
+    Extracts DataFrame and SQL from the Genie response.
+    """
+    attachments = message.get("attachments", [])
     
-    if 'content' in complete_message:
-        return complete_message.get('content', ''), None
-    return "No response available", None
-
-def genie_query_router_aware(question: str, target_space_id: str, conversation_id: Optional[str] = None) -> Tuple[Optional[str], Optional[str], Union[str, pd.DataFrame], Optional[str]]:
-    # Initialize client with USER TOKEN only
-    client = GenieClient(host=DATABRICKS_HOST, space_id=target_space_id, user_token=DATABRICKS_TOKEN)
-
-    try:
-        if conversation_id is None:
-            logger.info(f"Starting NEW conversation in Space: {target_space_id}...")
-            resp = client.start_conversation(question)
-            conv_id = resp.get("conversation_id")
-            msg_id = resp.get("message_id")
-        else:
-            logger.info(f"Continuing conversation {conversation_id}...")
+    for att in attachments:
+        # 1. Handle SQL & Data
+        if "query" in att:
+            # Extract SQL text immediately
+            sql_query = att.get("query", {}).get("query", "-- No SQL text provided")
             try:
-                resp = client.send_message(conversation_id, question)
-                conv_id = conversation_id
-                msg_id = resp.get("message_id")
+                # Fetch Result Data
+                raw = client.get_query_result(conv_id, msg_id, att["attachment_id"])
+                
+                # Parse Schema and Data
+                schema = raw.get('statement_response', {}).get('manifest', {}).get('schema', {})
+                cols = [c['name'] for c in schema.get('columns', [])]
+                data = raw.get('statement_response', {}).get('result', {}).get('data_array', [])
+                
+                df = pd.DataFrame(data, columns=cols) if cols else pd.DataFrame(data)
+                return df, sql_query
             except Exception as e:
-                logger.warning("Conversation expired or invalid. Starting new one.")
-                resp = client.start_conversation(question)
-                conv_id = resp.get("conversation_id")
-                msg_id = resp.get("message_id")
-
-        complete_msg = client.wait_for_message_completion(conv_id, msg_id)
-        result, query_text = process_genie_response(client, conv_id, msg_id, complete_msg)
+                return f"Error executing query: {str(e)}", sql_query
         
-        return conv_id, msg_id, result, query_text
+        # 2. Handle Text Response (No SQL)
+        if "text" in att:
+            return att["text"]["content"], None
+
+    return message.get("content", "No content returned."), None
+
+# --- MAIN EXECUTION ENTRY POINT ---
+def execute_genie_query(user_query: str, space_id: str, current_conv_id: Optional[str], user_token: str, host: str):
+    """
+    Orchestrates Genie call. 
+    Crucial: It accepts 'user_token' as an argument, passed from app.py.
+    """
+    if not user_token:
+        return current_conv_id, "Error: Token missing.", None
+
+    client = GenieClient(host, space_id, user_token)
+    
+    try:
+        # Start New OR Continue based on what the Router/App passed in
+        if not current_conv_id:
+            logger.info(f"Starting NEW conversation in {space_id}")
+            resp = client.start_conversation(user_query)
+            conv_id = resp["conversation_id"]
+            msg_id = resp["message_id"]
+        else:
+            logger.info(f"Continuing conversation {current_conv_id}")
+            try:
+                resp = client.send_message(current_conv_id, user_query)
+                conv_id = current_conv_id
+                msg_id = resp["message_id"]
+            except Exception:
+                # If ID is invalid/expired, auto-restart
+                logger.warning("Conversation ID invalid/expired. Starting new.")
+                resp = client.start_conversation(user_query)
+                conv_id = resp["conversation_id"]
+                msg_id = resp["message_id"]
+
+        final_msg = client.wait_for_completion(conv_id, msg_id)
+        result, sql = extract_genie_data(client, conv_id, msg_id, final_msg)
+        
+        return conv_id, result, sql
 
     except Exception as e:
-        logger.error(f"Genie Query Error: {e}")
-        return conversation_id, None, f"Error: {str(e)}", None
-
-# --- APP INTERFACE FUNCTIONS ---
-
-def route_question(text: str) -> str:
-    """Simple keyword routing."""
-    text_lower = text.lower()
-    if any(x in text_lower for x in ['salary', 'employee', 'hiring', 'hr']):
-        return SPACE_CONFIG["HR"]["id"]
-    # Default to Finance
-    return SPACE_CONFIG["FINANCE"]["id"]
-
-def execute_genie_query(user_query: str, space_id: str, current_conv_id: Optional[str]):
-    """Wrapper used by the Dash App."""
-    conv_id, _, result, sql = genie_query_router_aware(
-        question=user_query,
-        target_space_id=space_id,
-        conversation_id=current_conv_id
-    )
-    return conv_id, result, sql
-
-def generate_insights(df: pd.DataFrame) -> str:
-    """Basic insight generator (Placeholder for LLM summary)."""
-    if df.empty:
-        return "The result set is empty."
-    
-    desc = df.describe().to_markdown()
-    return f"### Data Summary\n\n**Rows:** {len(df)}\n**Columns:** {', '.join(df.columns)}\n\n{desc}"
+        logger.error(f"Genie Execution Failed: {e}")
+        return current_conv_id, f"System Error: {str(e)}", None
