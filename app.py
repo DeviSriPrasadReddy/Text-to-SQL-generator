@@ -1,11 +1,13 @@
 import dash
-from dash import html, dcc, Input, Output, State, MATCH, callback_context, no_update, dash_table
+from dash import html, dcc, Input, Output, State, callback_context, no_update, dash_table
 import dash_bootstrap_components as dbc
 import pandas as pd
 import logging
 import os
 import traceback
 import datetime
+import uuid
+import json
 from dotenv import load_dotenv
 
 # --- IMPORTS ---
@@ -14,59 +16,23 @@ from genie_backend import execute_genie_query
 
 load_dotenv()
 
-# --- CONFIG ---
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
 GENIE_USER_TOKEN = os.environ.get("DATABRICKS_TOKEN")
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], title="Genie Debugger")
 server = app.server
 
-# --- CUSTOM CSS (Terminal Style) ---
-app.index_string = '''
-<!DOCTYPE html>
-<html>
-    <head>
-        {%metas%}
-        <title>{%title%}</title>
-        {%favicon%}
-        {%css%}
-        <style>
-            .chat-container { height: 75vh; display: flex; flex-direction: column; }
-            .chat-window { flex-grow: 1; overflow-y: auto; padding: 20px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px;}
-            
-            /* The Debug Terminal */
-            .debug-terminal {
-                background-color: #1e1e1e;
-                color: #00ff00;
-                font-family: 'Courier New', monospace;
-                font-size: 0.8rem;
-                padding: 15px;
-                height: 200px;
-                overflow-y: auto;
-                border-radius: 5px;
-                white-space: pre-wrap;
-            }
-            .log-timestamp { color: #888; margin-right: 10px; }
-            .log-error { color: #ff5555; font-weight: bold; }
-            .log-info { color: #66d9ef; }
-        </style>
-    </head>
-    <body>
-        {%app_entry%}
-        <footer>{%config%}{%scripts%}{%renderer%}</footer>
-    </body>
-</html>
-'''
-
 # --- LAYOUT ---
 app.layout = dbc.Container([
     dbc.Row([
-        dbc.Col(html.H3("🧞 Genie Router + Debugger"), width=8, className="mt-3"),
-        dbc.Col(dbc.Switch(id="debug-mode-toggle", label="Show Debug Log", value=True), width=4, className="mt-3 text-end")
+        dbc.Col(html.H3("🧞 Genie Robust Router"), width=8, className="mt-3"),
+        dbc.Col(html.Div(id="status-header", children="System Ready", className="text-muted mt-3 text-end"), width=4)
     ]),
     html.Hr(),
     
-    # --- CHAT SECTION ---
+    # --- DEBUG WATCHER (Displays Raw Trigger Data) ---
+    dbc.Alert(id="trigger-watcher", color="danger", style={"fontSize": "10px", "fontFamily": "monospace", "overflowWrap": "break-word"}, children="Waiting for trigger..."),
+
     dbc.Row([
         dbc.Col([
             dbc.Card([dbc.CardHeader("Active Contexts"), dbc.CardBody(id="active-sessions-list")], className="mb-3"),
@@ -74,7 +40,7 @@ app.layout = dbc.Container([
         ], width=3),
 
         dbc.Col([
-            html.Div(id="chat-window", className="chat-window"),
+            html.Div(id="chat-window", style={"height": "500px", "overflowY": "auto", "padding": "20px", "border": "1px solid #ccc"}),
             dbc.Row([
                 dbc.Col(dbc.Input(id="user-input", placeholder="Type here...", autocomplete="off"), width=10),
                 dbc.Col(dbc.Button("Send", id="send-btn", color="primary", className="w-100"), width=2)
@@ -83,192 +49,196 @@ app.layout = dbc.Container([
         ], width=9)
     ], className="chat-container mb-3"),
 
-    # --- DEBUG CONSOLE SECTION ---
+    # --- TERMINAL ---
     dbc.Collapse(
-        dbc.Card([
-            dbc.CardHeader("🐞 Live Execution Log"),
-            dbc.CardBody(
-                html.Div(id="debug-console", className="debug-terminal", children="Waiting for input...")
-            )
-        ]),
+        dbc.Card([dbc.CardHeader("🐞 Live Execution Log"), dbc.CardBody(html.Div(id="debug-console", style={"background": "#000", "color": "#0f0", "height": "200px", "overflowY": "scroll", "whiteSpace": "pre-wrap"}))]),
         id="debug-collapse", is_open=True
     ),
 
-    # --- STORES ---
     dcc.Store(id="chat-history", data=[]),
     dcc.Store(id="session-store", data={}), 
+    
+    # THIS IS THE CRITICAL COMPONENT
     dcc.Store(id="backend-trigger", data=None),
+    
     html.Div(id="dummy-scroll-target")
 ], fluid=True, style={"padding": "20px"})
 
-# --- HELPER: LOGGING ---
-def format_log(current_logs, new_entry, level="INFO"):
+# --- LOGGING HELPER ---
+def format_log(current_logs, new_entry):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
-    css = "log-error" if level == "ERROR" else "log-info" if level == "SYSTEM" else ""
-    
-    # We return a list of HTML components to keep styling
     if not isinstance(current_logs, list): current_logs = []
-    
-    log_line = html.Div([
-        html.Span(f"[{ts}] ", className="log-timestamp"),
-        html.Span(f"[{level}] ", className=css),
-        html.Span(new_entry)
-    ])
-    current_logs.append(log_line)
+    current_logs.append(html.Div(f"[{ts}] {new_entry}"))
     return current_logs
 
-# --- HELPER: RENDER MESSAGE ---
+# --- MESSAGE RENDERER ---
 def render_message(msg):
     is_user = msg["role"] == "user"
-    css_class = "user-message" if is_user else "bot-message"
-    children = [html.Span(f"{msg.get('space_label', '')}", className="route-badge")] if not is_user else []
-    
+    css_class = "ml-auto bg-primary text-white" if is_user else "mr-auto bg-light text-dark border"
     content = msg["content"]
+    
+    children = [html.Small(msg.get('space_label', ''), style={"fontWeight":"bold", "color":"#ddd" if is_user else "#555"})]
+    
     if isinstance(content, str) and content.startswith('{') and "columns" in content:
-        df = pd.read_json(content, orient='split')
-        children.append(dash_table.DataTable(data=df.to_dict('records'), columns=[{"name": i, "id": i} for i in df.columns], style_table={'overflowX': 'auto'}))
+        try:
+            df = pd.read_json(content, orient='split')
+            children.append(dash_table.DataTable(data=df.to_dict('records'), columns=[{"name": i, "id": i} for i in df.columns], style_table={'overflowX': 'auto'}))
+        except: children.append(html.Div("Error parsing table"))
     else:
         children.append(dcc.Markdown(str(content)))
         
-    return html.Div(children, className=f"message {css_class}", style={"textAlign": "right" if is_user else "left", "marginBottom": "10px"})
+    return html.Div(children, className=f"p-3 rounded {css_class}", style={"width": "fit-content", "maxWidth": "85%", "marginBottom": "10px"})
 
-# --- MAIN CALLBACK ---
+
+# ==============================================================================
+# 🔄 CALLBACK 1: USER INPUT & ROUTING
+# ==============================================================================
 @app.callback(
-    [Output("chat-window", "children"),
+    [Output("chat-history", "data", allow_duplicate=True),
+     Output("chat-window", "children", allow_duplicate=True),
      Output("user-input", "value"),
-     Output("chat-history", "data"),
-     Output("backend-trigger", "data"),
-     Output("typing-indicator", "children"),
-     Output("session-store", "data"),
-     Output("active-sessions-list", "children"),
-     Output("debug-console", "children"),  # <--- UPDATING THE CONSOLE
-     Output("debug-collapse", "is_open")],
+     Output("backend-trigger", "data", allow_duplicate=True), # Writes to Store
+     Output("debug-console", "children", allow_duplicate=True),
+     Output("typing-indicator", "children", allow_duplicate=True)],
     [Input("send-btn", "n_clicks"),
-     Input("user-input", "n_submit"),
-     Input("reset-btn", "n_clicks"),
-     Input("backend-trigger", "data"),
-     Input("debug-mode-toggle", "value")],
+     Input("user-input", "n_submit")],
     [State("user-input", "value"),
      State("chat-history", "data"),
      State("session-store", "data"),
-     State("debug-console", "children")], # <--- GET OLD LOGS
+     State("debug-console", "children")],
     prevent_initial_call=True
 )
-def manage_chat(n_clicks, n_submit, n_reset, trigger_data, debug_toggle,
-                user_text, history, session_store, current_logs):
+def handle_user_routing(n_c, n_s, user_text, history, session_store, current_logs):
+    if not user_text: return no_update
+    if history is None: history = []
     
-    ctx = callback_context
-    trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
+    # 1. Update UI immediately
+    history.append({"role": "user", "content": user_text})
+    ui_messages = [render_message(m) for m in history]
+    current_logs = format_log(current_logs, f"STEP 1 START: User typed '{user_text}'")
+    
+    try:
+        # 2. Run Router
+        route_decision = orchestrate_routing(user_text, session_store)
+        current_logs = format_log(current_logs, f"Router Result: {route_decision}")
+        
+        target_space_id = route_decision.get("target_space_id")
+        target_conv_id = route_decision.get("target_conversation_id")
+        space_label = next((v['label'] for k,v in SPACE_CONFIG.items() if v['id'] == target_space_id), "Unknown")
+
+        # 3. Payload
+        trigger_payload = {
+            "text": user_text,
+            "space_id": target_space_id,
+            "conv_id": target_conv_id,
+            "space_label": space_label,
+            "uuid": str(uuid.uuid4()) # Unique ID
+        }
+        
+        current_logs = format_log(current_logs, f"WRITING TO TRIGGER STORE: {space_label}")
+        return history, ui_messages, "", trigger_payload, current_logs, f"Routing to {space_label}..."
+        
+    except Exception as e:
+        current_logs = format_log(current_logs, f"ROUTING ERROR: {e}")
+        return history, ui_messages, "", None, current_logs, "Error"
+
+
+# ==============================================================================
+# 👁️ WATCHER CALLBACK (Debugs the Hand-off)
+# ==============================================================================
+@app.callback(
+    Output("trigger-watcher", "children"),
+    Input("backend-trigger", "data")
+)
+def show_trigger_data(data):
+    # This proves if the data actually reached the browser
+    if not data: return "Trigger Store is Empty (None)"
+    return f"TRIGGER STORE UPDATED: {json.dumps(data)}"
+
+
+# ==============================================================================
+# ⚙️ CALLBACK 2: BACKEND EXECUTION
+# Triggered by TIMESTAMP, not Data (100% Reliable)
+# ==============================================================================
+@app.callback(
+    [Output("chat-history", "data", allow_duplicate=True),
+     Output("chat-window", "children", allow_duplicate=True),
+     Output("session-store", "data"),
+     Output("active-sessions-list", "children"),
+     Output("debug-console", "children", allow_duplicate=True),
+     Output("typing-indicator", "children", allow_duplicate=True)],
+    [Input("backend-trigger", "modified_timestamp")], # <--- CHANGED INPUT
+    [State("backend-trigger", "data"),                # <--- READ DATA AS STATE
+     State("chat-history", "data"),
+     State("session-store", "data"),
+     State("debug-console", "children")],
+    prevent_initial_call=True
+)
+def execute_backend_logic(ts, trigger_data, history, session_store, current_logs):
+    # 1. Validation
+    if not ts or not trigger_data:
+        return no_update
 
     if history is None: history = []
     if session_store is None: session_store = {}
     
-    # Initialize Log if empty
-    if not isinstance(current_logs, list): current_logs = []
+    current_logs = format_log(current_logs, "STEP 2 START: Timestamp detected change")
 
-    # --- RESET ---
-    if trigger_id == "reset-btn":
-        current_logs = format_log(current_logs, "--- RESET INITIATED ---", "SYSTEM")
-        return [], "", [], None, "", {}, "No active threads.", current_logs, debug_toggle
-
-    # --- STEP 1: ROUTING ---
-    if trigger_id in ["send-btn", "user-input"] and user_text:
-        current_logs = format_log(current_logs, f"User Input: '{user_text}'")
-        history.append({"role": "user", "content": user_text})
+    try:
+        # 2. Extract & Execute
+        space_id = trigger_data["space_id"]
+        current_logs = format_log(current_logs, f"Executing Genie in {space_id}...")
         
-        try:
-            current_logs = format_log(current_logs, "FUNCTION CALL: orchestrate_routing()", "SYSTEM")
-            
-            # CALL ROUTER
-            route_decision = orchestrate_routing(user_text, session_store)
-            
-            # Log the JSON result from LLM
-            current_logs = format_log(current_logs, f"Router Result: {route_decision}")
-            
-            target_space_id = route_decision.get("target_space_id")
-            target_conv_id = route_decision.get("target_conversation_id")
-            space_label = "Unknown"
-            
-            for k,v in SPACE_CONFIG.items():
-                if v['id'] == target_space_id: space_label = v['label']
+        final_conv_id, result, sql = execute_genie_query(
+            user_query=trigger_data["text"],
+            space_id=space_id,
+            current_conv_id=trigger_data["conv_id"], 
+            user_token=GENIE_USER_TOKEN,
+            host=DATABRICKS_HOST
+        )
+        
+        current_logs = format_log(current_logs, "Genie returned results.")
 
-            next_trigger = {
-                "text": user_text,
-                "space_id": target_space_id,
-                "conv_id": target_conv_id, 
-                "space_label": space_label
-            }
-            
-            current_logs = format_log(current_logs, f"Step 1 Success. Routing to: {space_label}")
-            
-            return [render_message(m) for m in history], "", history, next_trigger, f"Routing to {space_label}...", session_store, no_update, current_logs, debug_toggle
+        # 3. Update History
+        content = result
+        if isinstance(result, pd.DataFrame):
+            content = result.to_json(orient='split')
 
-        except Exception as e:
-            err = traceback.format_exc()
-            current_logs = format_log(current_logs, f"ROUTING CRASH: {str(e)}", "ERROR")
-            current_logs = format_log(current_logs, err, "ERROR") # Show full traceback in UI
-            return [render_message(m) for m in history], "", history, None, "Error", session_store, no_update, current_logs, debug_toggle
+        history.append({
+            "role": "assistant",
+            "content": content,
+            "space_label": trigger_data["space_label"],
+            "sql": sql
+        })
+        ui_messages = [render_message(m) for m in history]
 
-    # --- STEP 2: BACKEND EXECUTION ---
-    if trigger_id == "backend-trigger" and trigger_data:
-        try:
-            current_logs = format_log(current_logs, "--- STEP 2: GENIE EXECUTION ---", "SYSTEM")
-            
-            user_query = trigger_data["text"]
-            space_id = trigger_data["space_id"]
-            conv_id = trigger_data["conv_id"]
-            
-            current_logs = format_log(current_logs, f"Target Space ID: {space_id}")
-            current_logs = format_log(current_logs, f"Conversation ID: {conv_id} (None = New)")
-            
-            current_logs = format_log(current_logs, "FUNCTION CALL: execute_genie_query()", "SYSTEM")
-            
-            # CALL GENIE
-            final_conv_id, result, sql = execute_genie_query(
-                user_query=user_query,
-                space_id=space_id,
-                current_conv_id=conv_id, 
-                user_token=GENIE_USER_TOKEN,
-                host=DATABRICKS_HOST
-            )
-            
-            current_logs = format_log(current_logs, f"Genie Returned. SQL Length: {len(str(sql))}")
-            
-            # Format Result
-            content = result
-            if isinstance(result, pd.DataFrame):
-                content = result.to_json(orient='split')
-                current_logs = format_log(current_logs, f"Data Received: {len(result)} rows.")
+        # 4. Update Session
+        session_store[space_id] = {"conv_id": final_conv_id, "last_topic": trigger_data["text"]}
+        active_ui = [html.Div(f"● {sid[:5]}... : {data['last_topic'][:15]}...") for sid, data in session_store.items()]
 
-            history.append({
-                "role": "assistant",
-                "content": content,
-                "space_label": trigger_data["space_label"],
-                "sql": sql
-            })
+        return history, ui_messages, session_store, active_ui, current_logs, ""
 
-            # Update Session Store
-            session_store[space_id] = {
-                "conv_id": final_conv_id,
-                "last_topic": user_query 
-            }
-            
-            # Update Active List UI
-            active_ui = []
-            for sid, data in session_store.items():
-                active_ui.append(html.Div(f"● ID: {sid[:5]}... Topic: {data['last_topic'][:15]}..."))
+    except Exception as e:
+        err_msg = f"BACKEND ERROR: {str(e)}"
+        current_logs = format_log(current_logs, err_msg)
+        history.append({"role": "system", "content": f"❌ {err_msg}"})
+        return history, [render_message(m) for m in history], session_store, no_update, current_logs, ""
 
-            current_logs = format_log(current_logs, "--- CYCLE COMPLETE ---", "SYSTEM")
-            
-            return [render_message(m) for m in history], no_update, history, None, "", session_store, active_ui, current_logs, debug_toggle
-
-        except Exception as e:
-            err = traceback.format_exc()
-            current_logs = format_log(current_logs, f"BACKEND CRASH: {str(e)}", "ERROR")
-            current_logs = format_log(current_logs, err, "ERROR")
-            return [render_message(m) for m in history], no_update, history, None, "Error", session_store, no_update, current_logs, debug_toggle
-
-    return no_update
+# --- RESET ---
+@app.callback(
+    [Output("chat-history", "data", allow_duplicate=True),
+     Output("chat-window", "children", allow_duplicate=True),
+     Output("session-store", "data", allow_duplicate=True),
+     Output("active-sessions-list", "children", allow_duplicate=True),
+     Output("debug-console", "children", allow_duplicate=True),
+     Output("backend-trigger", "data", allow_duplicate=True)],
+    [Input("reset-btn", "n_clicks")],
+    [State("debug-console", "children")],
+    prevent_initial_call=True
+)
+def reset_app(n, logs):
+    logs = format_log(logs, "--- SYSTEM RESET ---")
+    return [], [], {}, "No active threads.", logs, None
 
 # Scroll Script
 app.clientside_callback(
