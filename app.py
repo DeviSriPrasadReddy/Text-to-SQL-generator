@@ -20,7 +20,7 @@ GENIE_USER_TOKEN = os.environ.get("DATABRICKS_TOKEN")
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], title="Genie Router")
 server = app.server
 
-# --- CSS ---
+# --- CSS (Includes Scroll Fix & SQL Toggle) ---
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -30,18 +30,35 @@ app.index_string = '''
         {%favicon%}
         {%css%}
         <style>
-            .chat-container { height: 65vh; display: flex; flex-direction: column; }
-            .chat-window { flex-grow: 1; overflow-y: auto; padding: 20px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px;}
+            /* 1. Main Layout: Fixed height to allow inner scrolling */
+            .chat-container { 
+                height: 75vh; 
+            }
             
+            /* 2. Column Wrapper to stack Chat + Input properly */
+            .chat-col-wrapper {
+                height: 100%;
+                display: flex;
+                flex-direction: column;
+            }
+
+            /* 3. The Window itself: Grows and Scrolls */
+            .chat-window { 
+                flex-grow: 1; 
+                overflow-y: auto; 
+                padding: 20px; 
+                background: #f8f9fa; 
+                border: 1px solid #dee2e6; 
+                border-radius: 5px;
+            }
+
             /* Debug Terminal */
             .debug-terminal { background-color: #1e1e1e; color: #00ff00; font-family: 'Courier New', monospace; font-size: 0.8rem; padding: 15px; height: 200px; overflow-y: auto; border-radius: 5px; white-space: pre-wrap; }
-            
-            /* Logs */
             .log-timestamp { color: #888; margin-right: 10px; }
             .log-error { color: #ff5555; font-weight: bold; }
             
             /* SQL Toggle Styling */
-            details > summary { cursor: pointer; color: #007bff; font-size: 0.8rem; margin-top: 8px; outline: none; list-style: none; user-select: none; }
+            details > summary { cursor: pointer; color: #007bff; font-size: 0.8rem; margin-top: 8px; outline: none; list-style: none; }
             details > summary::-webkit-details-marker { display: none; }
             details > summary::after { content: " ▼ Show Generated SQL"; }
             details[open] > summary::after { content: " ▲ Hide SQL"; }
@@ -58,32 +75,41 @@ app.index_string = '''
 # --- LAYOUT ---
 app.layout = dbc.Container([
     dbc.Row([
-        dbc.Col(html.H3("🧞 Genie Router"), width=8, className="mt-3"),
+        dbc.Col(html.H3("🧞 Genie Multi-Space Router"), width=8, className="mt-3"),
         dbc.Col(html.Div(id="status-indicator", className="mt-4"), width=4)
     ]),
     html.Hr(),
     
     dbc.Row([
+        # Sidebar
         dbc.Col([
             dbc.Card([dbc.CardHeader("Active Contexts"), dbc.CardBody(id="active-sessions-list")], className="mb-3"),
             dbc.Button("Reset Chat", id="reset-btn", color="outline-danger", size="sm", className="w-100")
-        ], width=3),
+        ], width=3, style={"height": "100%"}),
 
+        # Chat Area
         dbc.Col([
-            html.Div(id="chat-window", className="chat-window"),
-            dbc.Row([
-                dbc.Col(dbc.Input(id="user-input", placeholder="Type here...", autocomplete="off"), width=10),
-                dbc.Col(dbc.Button("Send", id="send-btn", color="primary", className="w-100"), width=2)
-            ], className="mt-3"),
-            html.Div(id="typing-indicator", className="text-muted small mt-1")
-        ], width=9)
+            html.Div([
+                html.Div(id="chat-window", className="chat-window"),
+                html.Div([
+                    dbc.Row([
+                        dbc.Col(dbc.Input(id="user-input", placeholder="Type here...", autocomplete="off"), width=10),
+                        dbc.Col(dbc.Button("Send", id="send-btn", color="primary", className="w-100"), width=2)
+                    ], className="mt-3"),
+                    html.Div(id="typing-indicator", className="text-muted small mt-1")
+                ])
+            ], className="chat-col-wrapper")
+        ], width=9, style={"height": "100%"})
+
     ], className="chat-container mb-3"),
 
+    # Debugger
     dbc.Collapse(
         dbc.Card([dbc.CardHeader("🐞 Logic Log"), dbc.CardBody(html.Div(id="debug-console", className="debug-terminal"))]),
         id="debug-collapse", is_open=True
     ),
 
+    # Stores
     dcc.Store(id="chat-history", data=[]),
     dcc.Store(id="session-store", data={}), 
     dcc.Store(id="backend-trigger", data=None),
@@ -97,7 +123,7 @@ def format_log(current_logs, new_entry):
     current_logs.append(html.Div(f"[{ts}] {new_entry}"))
     return current_logs
 
-# --- MESSAGE RENDERER (UPDATED) ---
+# --- MESSAGE RENDERER ---
 def render_message(msg):
     is_user = msg["role"] == "user"
     css_class = "user-message" if is_user else "bot-message"
@@ -105,37 +131,27 @@ def render_message(msg):
     bg = "#007bff" if is_user else "#e9ecef"
     color = "white" if is_user else "black"
     
-    # 1. Source Badge (Bot only)
     children = [html.Small(msg.get('space_label', ''), style={"display":"block", "marginBottom":"5px", "color":"#ccc" if is_user else "#666"})]
-    
-    # 2. Main Content (Table or Text)
     content = msg["content"]
+    
+    # Table vs Text
     if isinstance(content, str) and content.startswith('{') and "columns" in content:
         try:
             df = pd.read_json(content, orient='split')
-            children.append(dash_table.DataTable(
-                data=df.to_dict('records'), 
-                columns=[{"name": i, "id": i} for i in df.columns], 
-                style_table={'overflowX': 'auto'},
-                style_cell={'textAlign': 'left', 'color': 'black'}
-            ))
-        except: 
-            children.append(html.Div(str(content)))
+            children.append(dash_table.DataTable(data=df.to_dict('records'), columns=[{"name": i, "id": i} for i in df.columns], style_table={'overflowX': 'auto'}, style_cell={'textAlign': 'left', 'color': 'black'}))
+        except: children.append(html.Div(str(content)))
     else:
         children.append(dcc.Markdown(str(content)))
-
-    # 3. SQL Toggle (Bot only, IF SQL exists) <--- FIXED HERE
+    
+    # SQL Toggle
     if not is_user and msg.get("sql"):
-        children.append(html.Details([
-            html.Summary(""), # Text is handled by CSS ::after
-            html.Pre(msg["sql"])
-        ]))
+        children.append(html.Details([html.Summary(""), html.Pre(msg["sql"])]))
         
     return html.Div(children, style={"textAlign": align, "backgroundColor": bg, "color": color, "padding": "10px", "borderRadius": "10px", "marginBottom": "10px", "marginLeft": "auto" if is_user else "0", "marginRight": "0" if is_user else "auto", "width": "fit-content", "maxWidth": "85%"})
 
 
 # ==============================================================================
-# 🔄 STEP 1: ROUTING 
+# 🔄 STEP 1: ROUTING (Determines Space & ID)
 # ==============================================================================
 @app.callback(
     [Output("chat-window", "children", allow_duplicate=True),
@@ -155,17 +171,17 @@ def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
     if not user_text: return no_update
     if history is None: history = []
     
-    # Visual update only (Don't save to history store yet)
+    # UI Update Only (Visual)
     temp_history = history + [{"role": "user", "content": user_text}]
     ui_messages = [render_message(m) for m in temp_history]
-    
     logs = format_log(logs, f"Step 1: Routing '{user_text}'")
     
     try:
+        # Run Router
         route_decision = orchestrate_routing(user_text, session_store)
         target_space_id = route_decision.get("target_space_id")
         
-        # ID Reuse Logic
+        # Force ID Reuse (Sticky Context)
         target_conv_id = None
         if target_space_id in session_store:
             existing_id = session_store[target_space_id].get("conv_id")
@@ -173,12 +189,13 @@ def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
                 target_conv_id = existing_id
                 logs = format_log(logs, f"♻️ Reusing ID: {existing_id}")
             else:
-                logs = format_log(logs, f"ℹ️ Space found, New ID needed.")
+                logs = format_log(logs, "ℹ️ New ID needed.")
         else:
-            logs = format_log(logs, f"🆕 New Space detected.")
+            logs = format_log(logs, "🆕 New Space.")
 
         space_label = next((v['label'] for k,v in SPACE_CONFIG.items() if v['id'] == target_space_id), "Unknown")
         
+        # Create Trigger Payload
         trigger_payload = {
             "text": user_text,
             "space_id": target_space_id,
@@ -195,7 +212,7 @@ def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
 
 
 # ==============================================================================
-# ⚙️ STEP 2: EXECUTION 
+# ⚙️ STEP 2: EXECUTION (Runs Genie & Saves History)
 # ==============================================================================
 @app.callback(
     [Output("chat-history", "data", allow_duplicate=True),
@@ -219,7 +236,7 @@ def step_2_execution(ts, trigger_data, history, session_store, logs):
     user_text = trigger_data["text"]
     logs = format_log(logs, f"Step 2: Executing in {trigger_data['space_id']}...")
 
-    # Save User Message to History Store now
+    # Save User Input to Store Now
     history.append({"role": "user", "content": user_text})
 
     try:
@@ -233,7 +250,6 @@ def step_2_execution(ts, trigger_data, history, session_store, logs):
         
         logs = format_log(logs, f"Genie Success. ID: {final_conv_id}")
 
-        # Format Result
         content = result
         if isinstance(result, pd.DataFrame):
             content = result.to_json(orient='split')
@@ -242,14 +258,10 @@ def step_2_execution(ts, trigger_data, history, session_store, logs):
             "role": "assistant",
             "content": content,
             "space_label": trigger_data["space_label"],
-            "sql": sql # <--- SQL IS SAVED HERE
+            "sql": sql
         })
 
-        # Update Session Store
-        session_store[trigger_data["space_id"]] = {
-            "conv_id": final_conv_id, 
-            "last_topic": user_text
-        }
+        session_store[trigger_data["space_id"]] = {"conv_id": final_conv_id, "last_topic": user_text}
 
         ui_messages = [render_message(m) for m in history]
         
@@ -278,10 +290,19 @@ def step_2_execution(ts, trigger_data, history, session_store, logs):
 def reset_app(n):
     return [], [], {}, "No active contexts.", None
 
-# Scroll Script
+# --- SCROLL (Delayed) ---
 app.clientside_callback(
-    """function(c){ var w = document.getElementById('chat-window'); if(w){ w.scrollTop = w.scrollHeight; } return null; }""",
-    Output("dummy-scroll-target", "children"), Input("chat-window", "children")
+    """
+    function(children) {
+        var chat_window = document.getElementById('chat-window');
+        if(chat_window) {
+            setTimeout(function() { chat_window.scrollTop = chat_window.scrollHeight; }, 100);
+        }
+        return null;
+    }
+    """,
+    Output("dummy-scroll-target", "children"),
+    Input("chat-window", "children")
 )
 
 if __name__ == "__main__":
