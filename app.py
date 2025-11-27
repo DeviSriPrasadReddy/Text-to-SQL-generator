@@ -6,21 +6,24 @@ import datetime
 import uuid
 import os
 import traceback
+import json
 from dotenv import load_dotenv
 
 # --- IMPORTS ---
+# Ensure routing.py and genie_backend.py are in the same folder
 from routing import SPACE_CONFIG, orchestrate_routing
 from genie_backend import execute_genie_query
 
 load_dotenv()
 
+# --- CONFIGURATION ---
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
 GENIE_USER_TOKEN = os.environ.get("DATABRICKS_TOKEN")
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], title="Genie Router")
 server = app.server
 
-# --- CSS (Includes Scroll Fix & SQL Toggle) ---
+# --- CSS STYLING ---
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -30,19 +33,17 @@ app.index_string = '''
         {%favicon%}
         {%css%}
         <style>
-            /* 1. Main Layout: Fixed height to allow inner scrolling */
-            .chat-container { 
-                height: 75vh; 
-            }
+            /* 1. Main Layout: Fixed height */
+            .chat-container { height: 70vh; }
             
-            /* 2. Column Wrapper to stack Chat + Input properly */
+            /* 2. Column Wrapper */
             .chat-col-wrapper {
                 height: 100%;
                 display: flex;
                 flex-direction: column;
             }
 
-            /* 3. The Window itself: Grows and Scrolls */
+            /* 3. Chat Window: Grows and Scrolls */
             .chat-window { 
                 flex-grow: 1; 
                 overflow-y: auto; 
@@ -56,6 +57,7 @@ app.index_string = '''
             .debug-terminal { background-color: #1e1e1e; color: #00ff00; font-family: 'Courier New', monospace; font-size: 0.8rem; padding: 15px; height: 200px; overflow-y: auto; border-radius: 5px; white-space: pre-wrap; }
             .log-timestamp { color: #888; margin-right: 10px; }
             .log-error { color: #ff5555; font-weight: bold; }
+            .log-info { color: #66d9ef; }
             
             /* SQL Toggle Styling */
             details > summary { cursor: pointer; color: #007bff; font-size: 0.8rem; margin-top: 8px; outline: none; list-style: none; }
@@ -116,11 +118,15 @@ app.layout = dbc.Container([
     html.Div(id="dummy-scroll-target")
 ], fluid=True, style={"padding": "20px"})
 
-# --- LOGGING HELPER ---
-def format_log(current_logs, new_entry):
+# --- LOGGING HELPERS ---
+def create_log_element(text, level="INFO"):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
+    css = "log-error" if level == "ERROR" else "log-info" if level == "SYSTEM" else ""
+    return html.Div([html.Span(f"[{ts}] ", className="log-timestamp"), html.Span(f"[{level}] ", className=css), html.Span(str(text))])
+
+def format_log(current_logs, new_entry):
     if not isinstance(current_logs, list): current_logs = []
-    current_logs.append(html.Div(f"[{ts}] {new_entry}"))
+    current_logs.append(create_log_element(new_entry))
     return current_logs
 
 # --- MESSAGE RENDERER ---
@@ -131,19 +137,29 @@ def render_message(msg):
     bg = "#007bff" if is_user else "#e9ecef"
     color = "white" if is_user else "black"
     
+    # Badge (Bot Only)
     children = [html.Small(msg.get('space_label', ''), style={"display":"block", "marginBottom":"5px", "color":"#ccc" if is_user else "#666"})]
+    
     content = msg["content"]
     
-    # Table vs Text
+    # 1. Table Handling
     if isinstance(content, str) and content.startswith('{') and "columns" in content:
         try:
             df = pd.read_json(content, orient='split')
-            children.append(dash_table.DataTable(data=df.to_dict('records'), columns=[{"name": i, "id": i} for i in df.columns], style_table={'overflowX': 'auto'}, style_cell={'textAlign': 'left', 'color': 'black'}))
-        except: children.append(html.Div(str(content)))
+            children.append(dash_table.DataTable(
+                data=df.to_dict('records'), 
+                columns=[{"name": i, "id": i} for i in df.columns], 
+                style_table={'overflowX': 'auto'}, 
+                style_cell={'textAlign': 'left', 'color': 'black', 'fontFamily': 'sans-serif'},
+                page_size=10
+            ))
+        except: 
+            children.append(html.Div(str(content)))
     else:
+        # 2. Markdown Handling
         children.append(dcc.Markdown(str(content)))
     
-    # SQL Toggle
+    # 3. SQL Toggle
     if not is_user and msg.get("sql"):
         children.append(html.Details([html.Summary(""), html.Pre(msg["sql"])]))
         
@@ -167,52 +183,53 @@ def render_message(msg):
      State("debug-console", "children")],
     prevent_initial_call=True
 )
-def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
+def step_1_routing(n_c, n_s, user_text, history, session_store, current_ui_logs):
     if not user_text: return no_update
     if history is None: history = []
     
-    # UI Update Only (Visual)
+    # Render User Message Visuals
     temp_history = history + [{"role": "user", "content": user_text}]
     ui_messages = [render_message(m) for m in temp_history]
-    logs = format_log(logs, f"Step 1: Routing '{user_text}'")
+    
+    # 📝 COLLECT LOGS (Don't render yet, pass to Step 2)
+    step_logs = [f"Step 1: Routing '{user_text}'"]
     
     try:
-        # Run Router
         route_decision = orchestrate_routing(user_text, session_store)
         target_space_id = route_decision.get("target_space_id")
         
-        # Force ID Reuse (Sticky Context)
         target_conv_id = None
         if target_space_id in session_store:
             existing_id = session_store[target_space_id].get("conv_id")
             if existing_id:
                 target_conv_id = existing_id
-                logs = format_log(logs, f"♻️ Reusing ID: {existing_id}")
+                step_logs.append(f"♻️ Reusing Context ID: {existing_id}")
             else:
-                logs = format_log(logs, "ℹ️ New ID needed.")
+                step_logs.append("ℹ️ Context found, but ID missing. New Thread.")
         else:
-            logs = format_log(logs, "🆕 New Space.")
+            step_logs.append("🆕 New Space detected.")
 
         space_label = next((v['label'] for k,v in SPACE_CONFIG.items() if v['id'] == target_space_id), "Unknown")
         
-        # Create Trigger Payload
         trigger_payload = {
             "text": user_text,
             "space_id": target_space_id,
             "conv_id": target_conv_id,
             "space_label": space_label,
-            "uuid": str(uuid.uuid4())
+            "uuid": str(uuid.uuid4()),
+            "logs": step_logs # <--- PASS LOGS HERE
         }
         
-        return ui_messages, "", trigger_payload, logs, f"Routing to {space_label}..."
+        return ui_messages, "", trigger_payload, no_update, f"Routing to {space_label}..."
 
     except Exception as e:
-        logs = format_log(logs, f"ROUTING ERROR: {e}")
-        return ui_messages, "", None, logs, "Error"
+        # If Step 1 fails, we DO update the logs immediately
+        current_ui_logs = format_log(current_ui_logs, f"ROUTING ERROR: {e}")
+        return ui_messages, "", None, current_ui_logs, "Error"
 
 
 # ==============================================================================
-# ⚙️ STEP 2: EXECUTION (Runs Genie & Saves History)
+# ⚙️ STEP 2: EXECUTION (Safe Serialization)
 # ==============================================================================
 @app.callback(
     [Output("chat-history", "data", allow_duplicate=True),
@@ -228,15 +245,21 @@ def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
      State("debug-console", "children")],
     prevent_initial_call=True
 )
-def step_2_execution(ts, trigger_data, history, session_store, logs):
+def step_2_execution(ts, trigger_data, history, session_store, current_ui_logs):
     if not ts or not trigger_data: return no_update
     if history is None: history = []
     if session_store is None: session_store = {}
+    if not isinstance(current_ui_logs, list): current_ui_logs = []
+
+    # 1. UNPACK LOGS FROM STEP 1
+    passed_logs = trigger_data.get("logs", [])
+    for log_text in passed_logs:
+        current_ui_logs.append(create_log_element(log_text))
 
     user_text = trigger_data["text"]
-    logs = format_log(logs, f"Step 2: Executing in {trigger_data['space_id']}...")
+    current_ui_logs.append(create_log_element(f"Step 2: Calling Genie API for {trigger_data['space_label']}...", "SYSTEM"))
 
-    # Save User Input to Store Now
+    # Save User Input to History Store
     history.append({"role": "user", "content": user_text})
 
     try:
@@ -248,15 +271,31 @@ def step_2_execution(ts, trigger_data, history, session_store, logs):
             host=DATABRICKS_HOST
         )
         
-        logs = format_log(logs, f"Genie Success. ID: {final_conv_id}")
+        # ---------------------------------------------------------------------
+        # 🛡️ SERIALIZATION SAFETY BLOCK
+        # ---------------------------------------------------------------------
+        content_to_store = "No content returned."
 
-        content = result
         if isinstance(result, pd.DataFrame):
-            content = result.to_json(orient='split')
+            if result.empty:
+                content_to_store = "**No data found matching your query.**"
+                current_ui_logs.append(create_log_element("⚠️ Query returned 0 rows.", "SYSTEM"))
+            else:
+                # Convert DF to JSON String
+                content_to_store = result.to_json(orient='split', date_format='iso')
+                current_ui_logs.append(create_log_element(f"✅ Data received: {len(result)} rows.", "SYSTEM"))
+        elif isinstance(result, str):
+            content_to_store = result
+            current_ui_logs.append(create_log_element("✅ Text response received.", "SYSTEM"))
+        else:
+            # Fallback for unexpected types (Lists, Dicts, etc)
+            content_to_store = str(result)
+            current_ui_logs.append(create_log_element(f"⚠️ Unexpected data type: {type(result)}", "SYSTEM"))
+        # ---------------------------------------------------------------------
 
         history.append({
             "role": "assistant",
-            "content": content,
+            "content": content_to_store,
             "space_label": trigger_data["space_label"],
             "sql": sql
         })
@@ -270,12 +309,12 @@ def step_2_execution(ts, trigger_data, history, session_store, logs):
             lbl = next((v['label'] for k,v in SPACE_CONFIG.items() if v['id'] == sid), sid[:5])
             active_ui.append(html.Div(f"● {lbl}: ...{data['last_topic'][-15:]}", style={"fontSize":"10px"}))
 
-        return history, ui_messages, session_store, active_ui, logs, ""
+        return history, ui_messages, session_store, active_ui, current_ui_logs, ""
 
     except Exception as e:
-        logs = format_log(logs, f"BACKEND ERROR: {e}")
+        current_ui_logs.append(create_log_element(f"BACKEND ERROR: {e}", "ERROR"))
         history.append({"role": "system", "content": f"Error: {str(e)}"})
-        return history, [render_message(m) for m in history], session_store, no_update, logs, ""
+        return history, [render_message(m) for m in history], session_store, no_update, current_ui_logs, ""
 
 # --- RESET ---
 @app.callback(
