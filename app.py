@@ -2,7 +2,6 @@ import dash
 from dash import html, dcc, Input, Output, State, MATCH, callback_context, no_update, dash_table
 import dash_bootstrap_components as dbc
 import pandas as pd
-import flask
 import datetime
 import uuid
 import os
@@ -10,9 +9,13 @@ import traceback
 import json
 import requests
 from dotenv import load_dotenv
+import flask
+from databricks.sdk import WorkspaceClient
+from databricks.sdk import ChatMessage, ChatMessageRole
 
 # --- IMPORTS ---
-from routing import SPACE_CONFIG, orchestrate_routing
+# Ensure these files exist in the same directory!
+from route import SPACE_CONFIG, orchestrate_routing
 from genie_backend import execute_genie_query
 
 load_dotenv()
@@ -21,10 +24,8 @@ load_dotenv()
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
 GENIE_USER_TOKEN = os.environ.get("DATABRICKS_TOKEN")
 
-# Setup LLM Endpoint for Insights (Using same credentials)
-clean_host = DATABRICKS_HOST.replace("https://", "").replace("http://", "").strip("/")
-LLM_ENDPOINT_URL = f"https://{clean_host}/serving-endpoints/databricks-meta-llama-3-70b-instruct/invocations"
-
+# Setup LLM Endpoint for Insights
+LLM_ENDPOINT_URL = os.environ.get("SERVING_ENDPOINT_NAME")
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP, dbc.icons.BOOTSTRAP], title="Genie Router")
 server = app.server
 
@@ -101,7 +102,7 @@ app.layout = dbc.Container([
     dcc.Store(id="chat-history", data=[]),
     dcc.Store(id="session-store", data={}), 
     dcc.Store(id="backend-trigger", data=None),
-    dcc.Download(id="download-dataframe-csv"), # Handles Download
+    dcc.Download(id="download-dataframe-csv"), 
     html.Div(id="dummy-scroll-target")
 ], fluid=True, style={"padding": "20px"})
 
@@ -137,13 +138,12 @@ def generate_data_insights(df: pd.DataFrame) -> str:
     """
 
     # 2. Call LLM
-    payload = {"messages": [{"role": "user", "content": prompt}], "temperature": 0.3, "max_tokens": 400}
-    headers = {"Authorization": f"Bearer {GENIE_USER_TOKEN}", "Content-Type": "application/json"}
-    
+        
     try:
-        response = requests.post(LLM_ENDPOINT_URL, json=payload, headers=headers)
-        response.raise_for_status()
-        return response.json()['choices'][0]['message']['content']
+        client = WorkspaceClient()
+        response = client.serving_endpoints.query(os.environ.get("SERVING_ENDPOINT_NAME"),messages=[ChatMessage(content=prompt,role=(ChatMessageRole,USER)],)
+        
+        return response['choices'][0]message.content
     except Exception as e:
         return f"Error generating insights: {str(e)}"
 
@@ -260,6 +260,9 @@ def generate_insights_action(n_clicks, history):
     prevent_initial_call=True
 )
 def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
+    # CRITICAL: Print to server logs to confirm click is registered
+    print(f"[SERVER] Step 1 Triggered with text: {user_text}", flush=True)
+
     if not user_text: return no_update
     if history is None: history = []
     
@@ -290,10 +293,12 @@ def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
             "logs": logs
         }
         
-        return ui_messages, "", trigger_payload, no_update, f"Routing to {space_label}..."
+        # NOTE: returning logs here is crucial so the user sees "Routing..."
+        return ui_messages, "", trigger_payload, logs, f"Routing to {space_label}..."
 
     except Exception as e:
         logs = format_log(logs, f"ROUTING ERROR: {e}")
+        # Return logs even on error
         return ui_messages, "", None, logs, "Error"
 
 
@@ -328,7 +333,7 @@ def step_2_execution(ts, trigger_data, history, session_store, current_ui_logs):
     current_ui_logs.append(create_log_element(f"Step 2: Calling Genie...", "SYSTEM"))
 
     history.append({"role": "user", "content": user_text, "msg_id": str(uuid.uuid4())})
-
+    GENIE_USER_TOKEN = flask.request.headers.get('X-Forwarded-Access-Token')
     try:
         final_conv_id, result, sql = execute_genie_query(
             user_query=user_text,
@@ -352,7 +357,7 @@ def step_2_execution(ts, trigger_data, history, session_store, current_ui_logs):
             "content": content_to_store,
             "space_label": trigger_data["space_label"],
             "sql": sql,
-            "msg_id": str(uuid.uuid4()) # <--- ID FOR BUTTONS
+            "msg_id": str(uuid.uuid4())
         })
 
         session_store[trigger_data["space_id"]] = {"conv_id": final_conv_id, "last_topic": user_text}
