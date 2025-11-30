@@ -1,39 +1,32 @@
 import dash
-from dash import html, dcc, Input, Output, State, MATCH, ALL, no_update, callback_context, dash_table
+from dash import html, dcc, Input, Output, State, callback_context, no_update, dash_table
 import dash_bootstrap_components as dbc
 import pandas as pd
-import json
-import logging
+import datetime
 import uuid
 import os
-import datetime
+import json
+import traceback
 import concurrent.futures
-import flask
-import sqlparse
-import numpy as np
 from dotenv import load_dotenv
+from io import StringIO
 
-# --- DATABRICKS SDK ---
+# --- IMPORTS ---
+# Assuming these exist in your project structure
+from routing import SPACE_CONFIG, orchestrate_routing
+from genie_backend import execute_genie_query
 from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
 load_dotenv()
 
-# --- CONFIGURATION ---
-logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
-
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
-# Endpoint names from .env
-SERVING_ENDPOINT_NAME = os.environ.get("SERVING_ENDPOINT_NAME", "databricks-meta-llama-3-70b-instruct")
+GENIE_USER_TOKEN = os.environ.get("DATABRICKS_TOKEN")
+LLM_ENDPOINT_NAME = os.environ.get("LLM_ENDPOINT_NAME", "databricks-meta-llama-3-70b-instruct")
 
-# --- APP SETUP ---
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], title="Genie AI")
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], title="Genie Router")
 server = app.server
 
-# ==============================================================================
-# 🎨 CSS & LAYOUT CONFIGURATION (The "Fixed" UI)
-# ==============================================================================
+# --- CSS ---
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -43,84 +36,22 @@ app.index_string = '''
         {%favicon%}
         {%css%}
         <style>
-            /* 1. MAIN CONTAINER: Uses Flexbox to separate Header, Chat, and Input */
-            .main-container {
-                display: flex;
-                flex-direction: column;
-                height: 100vh; /* Full Viewport Height */
-                overflow: hidden; /* No scroll on the body */
-                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            }
-
-            /* 2. TOP NAV */
-            .top-nav {
-                flex-shrink: 0; /* Don't shrink */
-                height: 60px;
-                background: #1b1e23;
-                color: white;
-                display: flex;
-                align-items: center;
-                padding: 0 20px;
-                justify-content: space-between;
-            }
-
-            /* 3. CONTENT WRAPPER (Sidebar + Chat) */
-            .content-wrapper {
-                display: flex;
-                flex-grow: 1; /* Fills remaining height */
-                overflow: hidden; 
-            }
-
-            /* 4. SIDEBAR */
-            .sidebar {
-                width: 260px;
-                background: #f8f9fa;
-                border-right: 1px solid #dee2e6;
-                display: flex;
-                flex-direction: column;
-                padding: 15px;
-                transition: margin-left 0.3s ease;
-                flex-shrink: 0;
-            }
-            .sidebar.closed { margin-left: -260px; }
-            .chat-item { padding: 10px; cursor: pointer; border-radius: 5px; margin-bottom: 5px; font-size: 0.9rem; color: #333; }
-            .chat-item:hover { background: #e9ecef; }
-            .chat-item.active { background: #e2e6ea; font-weight: 600; border-left: 3px solid #007bff; }
-
-            /* 5. CHAT AREA (The Scrolling Part) */
-            .chat-area {
-                flex-grow: 1;
-                display: flex;
-                flex-direction: column;
-                background: white;
-                position: relative;
-            }
-
-            .chat-messages {
-                flex-grow: 1;
-                overflow-y: auto; /* SCROLL HERE */
-                padding: 20px 10% 20px 10%; /* Center content slightly */
-                scroll-behavior: smooth;
-            }
-
-            /* 6. FIXED INPUT AREA (Pinned to Bottom) */
-            .input-area {
-                flex-shrink: 0;
-                background: white;
-                padding: 20px 10%;
-                border-top: 1px solid #eee;
-            }
-
-            /* MESSAGES STYLING */
-            .message { margin-bottom: 20px; max-width: 100%; }
-            .user-message { text-align: right; }
-            .user-message .message-content { background: #007bff; color: white; display: inline-block; padding: 10px 15px; border-radius: 15px 15px 0 15px; text-align: left;}
-            .bot-message { text-align: left; }
-            .bot-message .message-content { background: #f1f3f4; color: black; display: inline-block; padding: 15px; border-radius: 15px 15px 15px 0; max-width: 100%; width: fit-content; }
+            .chat-container { height: 80vh; }
+            .chat-col-wrapper { height: 100%; display: flex; flex-direction: column; }
+            .chat-window { flex-grow: 1; overflow-y: auto; padding: 20px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px; }
             
-            /* TABLE & INSIGHTS */
-            .insight-section { margin-top: 15px; border-top: 1px solid #ddd; padding-top: 10px; }
-            .insight-content { background: #e8f4ff; padding: 15px; border-radius: 8px; border: 1px solid #b6d4fe; margin-top: 10px; font-size: 0.9rem; }
+            /* Action Bar for Insights */
+            .action-bar { min-height: 40px; padding: 5px 0; display: flex; justify-content: flex-end; }
+            
+            /* Debug Terminal */
+            .debug-terminal { background-color: #1e1e1e; color: #00ff00; font-family: 'Courier New', monospace; font-size: 0.8rem; padding: 15px; height: 200px; overflow-y: auto; border-radius: 5px; white-space: pre-wrap; }
+            
+            /* SQL Toggle Styling */
+            details > summary { cursor: pointer; color: #007bff; font-size: 0.8rem; margin-top: 8px; outline: none; list-style: none; }
+            details > summary::-webkit-details-marker { display: none; }
+            details > summary::after { content: " ▼ Show Generated SQL"; }
+            details[open] > summary::after { content: " ▲ Hide SQL"; }
+            details > pre { background: #2d2d2d; color: #f8f8f2; padding: 10px; border-radius: 5px; margin-top: 5px; font-size: 0.75rem; overflow-x: auto; white-space: pre-wrap; }
         </style>
     </head>
     <body>
@@ -130,364 +61,381 @@ app.index_string = '''
 </html>
 '''
 
-# ==============================================================================
-# ⏱️ HELPERS: TIMEOUT & BACKEND
-# ==============================================================================
-
+# --- TIMEOUT HELPER ---
 def run_with_timeout(func, args=(), kwargs=None, timeout_seconds=300):
-    """Executes a function with a strict 5-minute time limit."""
     if kwargs is None: kwargs = {}
     with concurrent.futures.ThreadPoolExecutor() as executor:
         future = executor.submit(func, *args, **kwargs)
         try:
             return future.result(timeout=timeout_seconds)
         except concurrent.futures.TimeoutError:
-            return "⚠️ **Timeout Error:** The process took longer than 5 minutes and was stopped."
-        except Exception as e:
-            return f"⚠️ **Error:** {str(e)}"
+            raise TimeoutError(f"Process exceeded the {timeout_seconds/60} minute time limit.")
 
-def get_user_info_from_header():
-    """Extracts user info from Flask headers (standard for Databricks Apps)."""
-    try:
-        # Standard Databricks Proxy Headers
-        token = flask.request.headers.get('X-Forwarded-Access-Token')
-        email = flask.request.headers.get('X-Forwarded-User', '')
-        initial = email[0].upper() if email else "U"
-        return token, initial
-    except:
-        return None, "U"
-
-def mock_genie_query(user_input):
+# --- LLM INSIGHTS HELPER (UPDATED) ---
+def generate_llm_insights(df):
     """
-    MOCK Backend for demonstration. 
-    Replace this with your actual 'genie_query' function.
+    Accepts a Pandas DataFrame directly.
+    Sends top 50 rows to Databricks Model Serving.
     """
-    import time
-    time.sleep(1) # Simulate network
-    
-    if "sales" in user_input.lower() or "data" in user_input.lower():
-        # Return a DataFrame
-        df = pd.DataFrame({
-            "Date": pd.date_range(start="2023-01-01", periods=10),
-            "Region": ["North", "South", "East", "West", "North", "South", "East", "West", "North", "South"],
-            "Sales": [100, 150, 200, 130, 120, 160, 210, 140, 110, 155],
-            "Profit": [20, 30, 40, 25, 22, 35, 45, 28, 21, 32]
-        })
-        sql = "SELECT * FROM sales_data WHERE date >= '2023-01-01' LIMIT 10"
-        return "conv_123", "msg_456", df.to_dict('records'), sql
-    else:
-        # Return Text
-        return "conv_123", "msg_456", f"I received your query: '{user_input}'. Try asking for 'sales data' to see a table.", None
-
-def call_llm_for_insights(df_json):
-    """Uses Databricks SDK to analyze the dataframe."""
     try:
-        df = pd.read_json(df_json, orient='split')
-        preview = df.head(30).to_csv(index=False)
+        w = WorkspaceClient(host=DATABRICKS_HOST, token=GENIE_USER_TOKEN)
+        
+        # Convert DF to CSV string for the prompt
+        # We limit to top 50 rows to manage token usage
+        preview_csv = df.head(50).to_csv(index=False)
         
         prompt = f"""
-        Analyze the following data (top 30 rows):
-        {preview}
+        Analyze the following dataset (showing top 50 rows):
         
-        Provide 3 concise, bulleted business insights.
+        {preview_csv}
+        
+        Provide 3-5 concise, high-value business insights based on this data. 
+        Format the output as a bulleted list.
         """
         
-        w = WorkspaceClient() # Uses env vars
         response = w.serving_endpoints.query(
-            name=SERVING_ENDPOINT_NAME,
-            messages=[{"role": "user", "content": prompt}],
+            name=LLM_ENDPOINT_NAME,
+            messages=[
+                {"role": "system", "content": "You are a data analyst helper."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
             max_tokens=500
         )
         return response.choices[0].message.content
     except Exception as e:
-        return f"Error generating insights: {str(e)}"
+        return f"Failed to generate insights: {str(e)}"
 
-def get_visual_spec_mock(df):
-    """Mock visualization generator."""
-    return {
-        "data": [{"type": "bar", "x": df[df.columns[0]], "y": df[df.columns[2]]}],
-        "layout": {"title": "Auto-Generated Chart", "height": 300}
-    }
-
-# ==============================================================================
-# 🖥️ LAYOUT
-# ==============================================================================
-app.layout = html.Div([
-    # 1. Top Navigation
-    html.Div([
-        html.Div([
-            html.Button("☰", id="sidebar-toggle", className="btn btn-outline-light btn-sm me-2"),
-            html.Span("🧞 Genie AI Space", style={"fontWeight": "bold", "fontSize": "1.2rem"})
-        ]),
-        html.Div(id="user-avatar", className="rounded-circle bg-primary text-white p-2", style={"width": "40px", "height": "40px", "textAlign": "center"})
-    ], className="top-nav"),
-
-    # 2. Content Wrapper
-    html.Div([
+# --- LAYOUT ---
+app.layout = dbc.Container([
+    dbc.Row([
+        dbc.Col(html.H3("🧞 Genie Multi-Space Router"), width=8, className="mt-3"),
+        dbc.Col(html.Div(id="status-indicator", className="mt-4"), width=4)
+    ]),
+    html.Hr(),
+    
+    dbc.Row([
         # Sidebar
-        html.Div([
-            dbc.Button("+ New Chat", id="new-chat-btn", color="primary", className="w-100 mb-3"),
-            html.Div(id="chat-list", className="flex-grow-1"),
-        ], id="sidebar", className="sidebar"),
+        dbc.Col([
+            dbc.Card([dbc.CardHeader("Active Contexts"), dbc.CardBody(id="active-sessions-list")], className="mb-3"),
+            dbc.Button("Reset Chat", id="reset-btn", color="outline-danger", size="sm", className="w-100")
+        ], width=3, style={"height": "100%"}),
 
         # Chat Area
-        html.Div([
-            # Messages Scroll Area
-            html.Div(id="chat-messages", className="chat-messages"),
-            
-            # Fixed Input Area
+        dbc.Col([
             html.Div([
-                dbc.InputGroup([
-                    dbc.Input(id="user-input", placeholder="Ask a question about your data...", autocomplete="off"),
-                    dbc.Button("Send", id="send-btn", color="primary")
-                ]),
-                html.Div(id="typing-indicator", className="text-muted small mt-1")
-            ], className="input-area")
-            
-        ], className="chat-area")
-
-    ], className="content-wrapper"),
-
-    # 3. Stores & Invisible Components
-    dcc.Store(id="chat-history-store", data=[]),
-    dcc.Store(id="session-store", data={"current_index": 0}),
-    dcc.Store(id="trigger-process", data=None),
-    html.Div(id="dummy-scroll"),
-    dcc.Store(id="initial-load", data=True)
-
-], className="main-container")
-
-
-# ==============================================================================
-# 🔄 CALLBACKS
-# ==============================================================================
-
-# 1. SIDEBAR TOGGLE
-@app.callback(
-    Output("sidebar", "className"),
-    Input("sidebar-toggle", "n_clicks"),
-    State("sidebar", "className"),
-    prevent_initial_call=True
-)
-def toggle_sidebar(n, current_class):
-    if "closed" in current_class:
-        return "sidebar"
-    return "sidebar closed"
-
-# 2. HANDLE INPUT & ROUTING
-@app.callback(
-    [Output("chat-messages", "children", allow_duplicate=True),
-     Output("user-input", "value"),
-     Output("trigger-process", "data"),
-     Output("chat-list", "children"),
-     Output("chat-history-store", "data", allow_duplicate=True),
-     Output("session-store", "data", allow_duplicate=True)],
-    [Input("send-btn", "n_clicks"), Input("user-input", "n_submit"), Input("new-chat-btn", "n_clicks")],
-    [State("user-input", "value"),
-     State("chat-messages", "children"),
-     State("chat-history-store", "data"),
-     State("session-store", "data")],
-    prevent_initial_call=True
-)
-def handle_input(n_send, n_submit, n_new, text, current_msgs, history, session):
-    ctx = callback_context
-    trigger_id = ctx.triggered[0]["prop_id"].split(".")[0]
-    
-    if not history: history = []
-    if current_msgs is None: current_msgs = []
-    
-    # CASE: NEW CHAT
-    if trigger_id == "new-chat-btn":
-        new_session_idx = 0
-        history.insert(0, {"query": "New Chat", "msgs": [], "dfs": {}})
-        # Rebuild Chat List
-        chat_list_ui = [html.Div(h.get("query", "Chat"), className="chat-item active" if i==0 else "chat-item") for i, h in enumerate(history)]
-        return [], "", None, chat_list_ui, history, {"current_index": 0}
-
-    # CASE: USER SUBMIT
-    if not text: return no_update
-    
-    # 1. Append User Message
-    user_msg_ui = html.Div(html.Div(text, className="message-content"), className="message user-message")
-    current_msgs.append(user_msg_ui)
-    
-    # 2. Append Loading Spinner
-    loading_ui = html.Div(html.Div(dbc.Spinner(size="sm"), className="message-content"), className="message bot-message", id="loading-placeholder")
-    current_msgs.append(loading_ui)
-    
-    # Update History
-    curr_idx = session.get("current_index", 0)
-    if curr_idx < len(history):
-        history[curr_idx]["msgs"] = current_msgs
-        if history[curr_idx]["query"] == "New Chat": history[curr_idx]["query"] = text[:20]
-    else:
-        history.insert(0, {"query": text[:20], "msgs": current_msgs, "dfs": {}})
-        curr_idx = 0
-
-    # Update UI List
-    chat_list_ui = [html.Div(h.get("query", "Chat"), className="chat-item active" if i==curr_idx else "chat-item") for i, h in enumerate(history)]
-
-    return current_msgs, "", {"text": text, "session_idx": curr_idx}, chat_list_ui, history, {"current_index": curr_idx}
-
-
-# 3. BACKEND EXECUTION (WITH TIMEOUT)
-@app.callback(
-    [Output("chat-messages", "children", allow_duplicate=True),
-     Output("chat-history-store", "data", allow_duplicate=True)],
-    [Input("trigger-process", "data")],
-    [State("chat-messages", "children"),
-     State("chat-history-store", "data")],
-    prevent_initial_call=True
-)
-def execute_backend(trigger, current_msgs, history):
-    if not trigger: return no_update
-    
-    user_text = trigger["text"]
-    session_idx = trigger["session_idx"]
-    
-    # Remove loading spinner (last item)
-    if current_msgs: current_msgs.pop()
-    
-    # --- WRAPPED TIMEOUT EXECUTION ---
-    # We wrap the external call
-    def run_query():
-        # Replace 'mock_genie_query' with 'genie_query' or your real function
-        return mock_genie_query(user_text)
-
-    try:
-        # EXECUTE WITH 5 MINUTE LIMIT
-        result = run_with_timeout(run_query, timeout_seconds=300)
-        
-        # Check for timeout string return
-        if isinstance(result, str) and result.startswith("⚠️"):
-            bot_content = dcc.Markdown(result)
-        else:
-            # Unpack successful result
-            conv_id, msg_id, data, sql = result
-            
-            if isinstance(data, list): # It's a Table/DataFrame
-                df = pd.DataFrame(data)
-                df_id = f"df_{uuid.uuid4().hex[:8]}"
+                # 1. Chat Window
+                html.Div(id="chat-window", className="chat-window"),
                 
-                # Save DF to history
-                history[session_idx]["dfs"][df_id] = df.to_json(orient='split')
-                
-                # 1. Render Table
-                table_comp = dash_table.DataTable(
-                    data=df.to_dict('records'),
-                    columns=[{"name": i, "id": i} for i in df.columns],
-                    style_table={'overflowX': 'auto'},
-                    page_size=5,
-                    style_header={'backgroundColor': '#f8f9fa', 'fontWeight': 'bold'},
-                    style_cell={'textAlign': 'left', 'padding': '10px'}
-                )
-                
-                # 2. Render Graph (Simple Mock)
-                fig = get_visual_spec_mock(df)
-                graph_comp = dcc.Graph(figure=fig, config={'displayModeBar': False})
-                
-                # 3. INSIGHT BUTTON (Placed Below)
-                insight_btn = dbc.Button(
-                    "✨ Generate Insights", 
-                    id={"type": "insight-btn", "index": df_id}, 
-                    color="warning", outline=True, size="sm", 
-                    className="mt-3"
-                )
-                
-                # 4. Insight Output Container
-                insight_div = html.Div(
-                    id={"type": "insight-out", "index": df_id},
-                    className="insight-section"
-                )
-                
-                bot_content = html.Div([
-                    dcc.Markdown(f"Found {len(df)} rows matching your query."),
-                    table_comp,
-                    html.Hr(),
-                    graph_comp,
-                    html.Div([insight_btn, insight_div]) # Grouped together
+                # 2. Action Bar (Insights Button appears here)
+                html.Div(id="insight-action-area", className="action-bar"),
+
+                # 3. Input Area
+                html.Div([
+                    dbc.Row([
+                        dbc.Col(dbc.Input(id="user-input", placeholder="Ask a question...", autocomplete="off"), width=10),
+                        dbc.Col(dbc.Button("Send", id="send-btn", color="primary", className="w-100"), width=2),
+                    ], className="mt-1"),
+                    html.Div(id="typing-indicator", className="text-muted small mt-1")
                 ])
-                
-            else: # Text Response
-                bot_content = dcc.Markdown(str(data))
+            ], className="chat-col-wrapper")
+        ], width=9, style={"height": "100%"})
+
+    ], className="chat-container mb-3"),
+
+    # Debugger
+    dbc.Collapse(
+        dbc.Card([dbc.CardHeader("🐞 Logic Log"), dbc.CardBody(html.Div(id="debug-console", className="debug-terminal"))]),
+        id="debug-collapse", is_open=True
+    ),
+
+    # Stores
+    dcc.Store(id="chat-history", data=[]),
+    dcc.Store(id="session-store", data={}), 
+    dcc.Store(id="backend-trigger", data=None),
+    html.Div(id="dummy-scroll-target")
+], fluid=True, style={"padding": "20px"})
+
+# --- LOGGING HELPER ---
+def format_log(current_logs, new_entry):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    if not isinstance(current_logs, list): current_logs = []
+    current_logs.append(html.Div(f"[{ts}] {new_entry}"))
+    return current_logs
+
+# --- MESSAGE RENDERER ---
+def render_message(msg):
+    is_user = msg["role"] == "user"
+    align = "right" if is_user else "left"
+    bg = "#007bff" if is_user else "#e9ecef"
+    color = "white" if is_user else "black"
+    
+    children = [html.Small(msg.get('space_label', ''), style={"display":"block", "marginBottom":"5px", "color":"#ccc" if is_user else "#666"})]
+    content = msg["content"]
+    msg_type = msg.get("type", "text") # Default to text
+    
+    # Handle Data Tables (Explicit Type Check)
+    if msg_type == "table":
+        try:
+            # Reconstruct DF for Display
+            df = pd.read_json(content, orient='split')
+            children.append(dash_table.DataTable(
+                data=df.to_dict('records'), 
+                columns=[{"name": i, "id": i} for i in df.columns], 
+                style_table={'overflowX': 'auto'}, 
+                style_cell={'textAlign': 'left', 'color': 'black'},
+                page_size=10
+            ))
+        except Exception as e:
+            children.append(html.Div(f"Error rendering table: {str(e)}", style={"color": "red"}))
+    else:
+        # Markdown / Text
+        children.append(dcc.Markdown(str(content)))
+    
+    # SQL Toggle
+    if not is_user and msg.get("sql"):
+        children.append(html.Details([html.Summary(""), html.Pre(msg["sql"])]))
         
-        # Create Message Bubble
-        bot_msg_ui = html.Div(html.Div(bot_content, className="message-content"), className="message bot-message")
-        current_msgs.append(bot_msg_ui)
+    return html.Div(children, style={"textAlign": align, "backgroundColor": bg, "color": color, "padding": "10px", "borderRadius": "10px", "marginBottom": "10px", "marginLeft": "auto" if is_user else "0", "marginRight": "0" if is_user else "auto", "width": "fit-content", "maxWidth": "85%"})
+
+
+# ==============================================================================
+# 🔄 STEP 1: ROUTING
+# ==============================================================================
+@app.callback(
+    [Output("chat-window", "children", allow_duplicate=True),
+     Output("user-input", "value"),
+     Output("backend-trigger", "data", allow_duplicate=True),
+     Output("debug-console", "children", allow_duplicate=True),
+     Output("typing-indicator", "children", allow_duplicate=True)],
+    [Input("send-btn", "n_clicks"),
+     Input("user-input", "n_submit")],
+    [State("user-input", "value"),
+     State("chat-history", "data"),
+     State("session-store", "data"),
+     State("debug-console", "children")],
+    prevent_initial_call=True
+)
+def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
+    if not user_text: return no_update
+    if history is None: history = []
+    
+    # Update UI immediately
+    temp_history = history + [{"role": "user", "content": user_text, "type": "text"}]
+    ui_messages = [render_message(m) for m in temp_history]
+    logs = format_log(logs, f"Step 1: Routing '{user_text}'")
+    
+    try:
+        route_decision = orchestrate_routing(user_text, session_store)
+        target_space_id = route_decision.get("target_space_id")
         
-        # Save Messages to History
-        history[session_idx]["msgs"] = current_msgs
+        target_conv_id = None
+        if target_space_id in session_store:
+            target_conv_id = session_store[target_space_id].get("conv_id")
+
+        space_label = next((v['label'] for k,v in SPACE_CONFIG.items() if v['id'] == target_space_id), "Unknown")
         
-        return current_msgs, history
+        trigger_payload = {
+            "text": user_text,
+            "space_id": target_space_id,
+            "conv_id": target_conv_id,
+            "space_label": space_label,
+            "uuid": str(uuid.uuid4())
+        }
+        
+        return ui_messages, "", trigger_payload, logs, f"Routing to {space_label}..."
 
     except Exception as e:
-        err_ui = html.Div(html.Div(f"Error: {str(e)}", className="message-content text-danger"), className="message bot-message")
-        current_msgs.append(err_ui)
-        return current_msgs, history
+        logs = format_log(logs, f"ROUTING ERROR: {e}")
+        return ui_messages, "", None, logs, "Error"
 
 
-# 4. GENERATE INSIGHTS (WITH TIMEOUT)
+# ==============================================================================
+# ⚙️ STEP 2: EXECUTION
+# ==============================================================================
 @app.callback(
-    Output({"type": "insight-out", "index": MATCH}, "children"),
-    Input({"type": "insight-btn", "index": MATCH}, "n_clicks"),
-    State({"type": "insight-btn", "index": MATCH}, "id"),
-    State("chat-history-store", "data"),
-    State("session-store", "data"),
+    [Output("chat-history", "data", allow_duplicate=True),
+     Output("chat-window", "children", allow_duplicate=True),
+     Output("session-store", "data"),
+     Output("active-sessions-list", "children"),
+     Output("debug-console", "children", allow_duplicate=True),
+     Output("typing-indicator", "children", allow_duplicate=True)],
+    [Input("backend-trigger", "modified_timestamp")],
+    [State("backend-trigger", "data"),
+     State("chat-history", "data"), 
+     State("session-store", "data"),
+     State("debug-console", "children")],
     prevent_initial_call=True
 )
-def generate_insights_click(n, btn_id, history, session):
-    if not n: return no_update
-    
-    df_id = btn_id["index"]
-    curr_idx = session.get("current_index", 0)
-    
-    # 1. Get DataFrame from Store
+def step_2_execution(ts, trigger_data, history, session_store, logs):
+    if not ts or not trigger_data: return no_update
+    if history is None: history = []
+    if session_store is None: session_store = {}
+
+    user_text = trigger_data["text"]
+    logs = format_log(logs, f"Step 2: Executing in {trigger_data['space_id']}...")
+
+    # Add user message to official history
+    history.append({"role": "user", "content": user_text, "type": "text"})
+
     try:
-        df_json = history[curr_idx]["dfs"].get(df_id)
-        if not df_json: return "Error: Data expired."
-    except:
-        return "Error: Session context lost."
+        def run_genie():
+            return execute_genie_query(
+                user_query=user_text,
+                space_id=trigger_data["space_id"],
+                current_conv_id=trigger_data["conv_id"], 
+                user_token=GENIE_USER_TOKEN,
+                host=DATABRICKS_HOST
+            )
+
+        final_conv_id, result, sql = run_with_timeout(run_genie, timeout_seconds=300)
         
+        logs = format_log(logs, f"Genie Success. ID: {final_conv_id}")
+
+        # Determine if result is DataFrame or Text
+        content = result
+        msg_type = "text"
+        
+        if isinstance(result, pd.DataFrame):
+            content = result.to_json(orient='split')
+            msg_type = "table"
+        elif isinstance(result, str):
+            msg_type = "text"
+
+        history.append({
+            "role": "assistant",
+            "content": content,
+            "type": msg_type,
+            "space_label": trigger_data["space_label"],
+            "sql": sql
+        })
+
+        session_store[trigger_data["space_id"]] = {"conv_id": final_conv_id, "last_topic": user_text}
+
+        ui_messages = [render_message(m) for m in history]
+        
+        active_ui = []
+        for sid, data in session_store.items():
+            lbl = next((v['label'] for k,v in SPACE_CONFIG.items() if v['id'] == sid), sid[:5])
+            active_ui.append(html.Div(f"● {lbl}: ...{data['last_topic'][-15:]}", style={"fontSize":"10px"}))
+
+        return history, ui_messages, session_store, active_ui, logs, ""
+
+    except Exception as e:
+        logs = format_log(logs, f"BACKEND ERROR: {e}")
+        history.append({"role": "system", "content": f"Error: {str(e)}", "type": "text"})
+        return history, [render_message(m) for m in history], session_store, no_update, logs, ""
+
+
+# ==============================================================================
+# 🔘 UI UPDATE: TOGGLE INSIGHT BUTTON
+# ==============================================================================
+@app.callback(
+    Output("insight-action-area", "children"),
+    Input("chat-history", "data")
+)
+def toggle_insight_button(history):
+    if not history: 
+        return []
+    
+    last_msg = history[-1]
+    
+    # Only show button if the last message is from assistant AND is a table
+    if last_msg.get("role") == "assistant" and last_msg.get("type") == "table":
+        return dbc.Button(
+            "✨ Analyze with AI", 
+            id="insight-btn", 
+            color="warning", 
+            outline=True, 
+            size="sm",
+            className="ms-auto"
+        )
+    return []
+
+
+# ==============================================================================
+# ✨ STEP 3: INSIGHT GENERATION
+# ==============================================================================
+@app.callback(
+    [Output("chat-history", "data", allow_duplicate=True),
+     Output("chat-window", "children", allow_duplicate=True),
+     Output("debug-console", "children", allow_duplicate=True),
+     Output("typing-indicator", "children", allow_duplicate=True)],
+    [Input("insight-btn", "n_clicks")],
+    [State("chat-history", "data"),
+     State("debug-console", "children")],
+    prevent_initial_call=True
+)
+def step_3_generate_insights(n_clicks, history, logs):
+    if not n_clicks or not history: return no_update
+    
+    logs = format_log(logs, "✨ Insight generation triggered...")
+    
+    # 1. Find the last data response
+    last_assistant_msg = history[-1]
+
+    if last_assistant_msg.get("type") != "table":
+        logs = format_log(logs, "⚠️ Last message was not a dataset.")
+        return no_update, no_update, logs, ""
+
+    content_json = last_assistant_msg.get("content")
+
     # 2. Call LLM with Timeout
-    def run_llm():
-        return call_llm_for_insights(df_json)
+    try:
+        logs = format_log(logs, "Deserializing data & sending to LLM...")
         
-    loading = html.Div([dbc.Spinner(size="sm"), " Analyzing data..."], className="text-muted")
-    
-    # We return loading first? Dash doesn't support generators easily in one callback.
-    # So we block (using run_with_timeout) and return result.
-    
-    insights = run_with_timeout(run_llm, timeout_seconds=300)
-    
-    return html.Div([
-        html.H6("📊 AI Analysis", className="mb-2"),
-        dcc.Markdown(insights)
-    ], className="insight-content")
+        # --- DESERIALIZE JSON TO DATAFRAME HERE ---
+        # This converts the stored JSON string back to a real DataFrame object
+        df_obj = pd.read_json(content_json, orient='split')
+        
+        # We pass the DataFrame object to the helper, NOT the JSON string
+        insights = run_with_timeout(generate_llm_insights, args=(df_obj,), timeout_seconds=300)
+        
+        history.append({
+            "role": "assistant", 
+            "content": f"**✨ AI Insights:**\n\n{insights}",
+            "type": "text",
+            "space_label": "LLM Analysis"
+        })
+        
+        ui_messages = [render_message(m) for m in history]
+        logs = format_log(logs, "Insights generated successfully.")
+        
+        return history, ui_messages, logs, ""
+        
+    except Exception as e:
+        logs = format_log(logs, f"LLM ERROR: {e}")
+        history.append({"role": "system", "content": f"Error generating insights: {str(e)}", "type": "text"})
+        return history, [render_message(m) for m in history], logs, ""
 
 
-# 5. AUTO SCROLL
+# --- RESET ---
+@app.callback(
+    [Output("chat-history", "data", allow_duplicate=True),
+     Output("chat-window", "children", allow_duplicate=True),
+     Output("session-store", "data", allow_duplicate=True),
+     Output("active-sessions-list", "children", allow_duplicate=True),
+     Output("backend-trigger", "data", allow_duplicate=True)],
+    [Input("reset-btn", "n_clicks")],
+    prevent_initial_call=True
+)
+def reset_app(n):
+    return [], [], {}, "No active contexts.", None
+
+# --- SCROLL (Delayed) ---
 app.clientside_callback(
     """
     function(children) {
-        var chat_div = document.getElementById('chat-messages');
-        if(chat_div) {
-            chat_div.scrollTop = chat_div.scrollHeight;
+        var chat_window = document.getElementById('chat-window');
+        if(chat_window) {
+            setTimeout(function() { chat_window.scrollTop = chat_window.scrollHeight; }, 100);
         }
         return null;
     }
     """,
-    Output("dummy-scroll", "children"),
-    Input("chat-messages", "children")
+    Output("dummy-scroll-target", "children"),
+    Input("chat-window", "children")
 )
-
-# 6. LOAD USER INITIAL
-@app.callback(
-    Output("user-avatar", "children"),
-    Input("initial-load", "data")
-)
-def load_user(d):
-    _, initial = get_user_info_from_header()
-    return initial
 
 if __name__ == "__main__":
     app.run_server(debug=True, port=8050)
