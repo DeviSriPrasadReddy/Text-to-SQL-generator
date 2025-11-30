@@ -10,22 +10,31 @@ import json
 import requests
 from dotenv import load_dotenv
 import flask
-from databricks.sdk import WorkspaceClient
-from databricks.sdk import ChatMessage, ChatMessageRole
 
-# --- IMPORTS ---
-# Ensure these files exist in the same directory!
-from route import SPACE_CONFIG, orchestrate_routing
-from genie_backend import execute_genie_query
+# --- DATABRICKS IMPORTS ---
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
+
+# --- LOCAL MODULE IMPORTS ---
+# Ensure 'route.py' and 'genie_backend.py' are in the same folder
+try:
+    from route import SPACE_CONFIG, orchestrate_routing
+    from genie_backend import execute_genie_query
+except ImportError as e:
+    print(f"CRITICAL WARNING: Could not import local modules: {e}")
+    # Mocking for standalone testing if files are missing
+    SPACE_CONFIG = {"1": {"id": "1", "label": "Finance"}}
+    def orchestrate_routing(text, store): return {"target_space_id": "1"}
+    def execute_genie_query(**kwargs): return "123", pd.DataFrame({"col": ["mock"]}), "SELECT * FROM mock"
 
 load_dotenv()
 
 # --- CONFIGURATION ---
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
+# Fallback token for local testing if headers aren't present
 GENIE_USER_TOKEN = os.environ.get("DATABRICKS_TOKEN")
-
-# Setup LLM Endpoint for Insights
 LLM_ENDPOINT_URL = os.environ.get("SERVING_ENDPOINT_NAME")
+
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP, dbc.icons.BOOTSTRAP], title="Genie Router")
 server = app.server
 
@@ -110,15 +119,15 @@ app.layout = dbc.Container([
 # --- LOGGING HELPERS ---
 def create_log_element(text, level="INFO"):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
-    css = "log-error" if level == "ERROR" else "log-info" if level == "SYSTEM" else ""
-    return html.Div([html.Span(f"[{ts}] ", className="log-timestamp"), html.Span(f"[{level}] ", className=css), html.Span(str(text))])
+    css = "text-danger" if level == "ERROR" else "text-info" if level == "SYSTEM" else ""
+    return html.Div([html.Span(f"[{ts}] ", className="text-muted mr-2"), html.Span(f"[{level}] ", className=css), html.Span(str(text))])
 
 def format_log(current_logs, new_entry):
     if not isinstance(current_logs, list): current_logs = []
     current_logs.append(create_log_element(new_entry))
     return current_logs
 
-# --- INSIGHTS LOGIC (LOCAL TO APP.PY) ---
+# --- INSIGHTS LOGIC ---
 def generate_data_insights(df: pd.DataFrame) -> str:
     """Sends dataframe stats to Databricks LLM for summary."""
     if df.empty: return "No data available."
@@ -138,13 +147,21 @@ def generate_data_insights(df: pd.DataFrame) -> str:
     """
 
     # 2. Call LLM
-        
     try:
         client = WorkspaceClient()
-        response = client.serving_endpoints.query(os.environ.get("SERVING_ENDPOINT_NAME"),messages=[ChatMessage(content=prompt,role=(ChatMessageRole,USER)],)
-        
-        return response['choices'][0]message.content
+        endpoint_name = os.environ.get("SERVING_ENDPOINT_NAME")
+        if not endpoint_name:
+            return "Error: SERVING_ENDPOINT_NAME env var is missing."
+            
+        # FIX: Corrected Syntax for ChatMessage and object access
+        response = client.serving_endpoints.query(
+            name=endpoint_name,
+            messages=[ChatMessage(content=prompt, role=ChatMessageRole.USER)],
+        )
+        # FIX: Corrected response access syntax (dot notation)
+        return response.choices[0].message.content
     except Exception as e:
+        traceback.print_exc()
         return f"Error generating insights: {str(e)}"
 
 # --- RENDER HELPER ---
@@ -155,7 +172,7 @@ def render_message(msg):
     css_class = "user-message" if is_user else "bot-message"
     align = "right" if is_user else "left"
     
-    children = [html.Small(msg.get('space_label', ''), style={"display":"block", "marginBottom":"5px", "color":"#999" if is_user else "#666", "fontWeight":"bold"})]
+    children = [html.Small(msg.get('space_label', ''), style={"display":"block", "marginBottom":"5px", "color":"#ddd" if is_user else "#666", "fontWeight":"bold"})]
     content = msg["content"]
     
     # 1. TABLE RENDERER
@@ -234,7 +251,6 @@ def generate_insights_action(n_clicks, history):
         if msg.get("msg_id") == target_id:
             try:
                 df = pd.read_json(msg["content"], orient='split')
-                # Call Local Function
                 insights = generate_data_insights(df)
                 return html.Div([html.Strong("AI Analysis:"), dcc.Markdown(insights)], className="insight-box")
             except Exception as e:
@@ -260,19 +276,22 @@ def generate_insights_action(n_clicks, history):
     prevent_initial_call=True
 )
 def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
-    # CRITICAL: Print to server logs to confirm click is registered
-    print(f"[SERVER] Step 1 Triggered with text: {user_text}", flush=True)
+    # Print to server console to confirm event firing
+    print(f"[DEBUG] Step 1 fired. Text: {user_text}")
 
-    if not user_text: return no_update
+    if not user_text: 
+        return no_update
+    
     if history is None: history = []
     
-    # Generate ID for User Message too (good practice)
-    temp_history = history + [{"role": "user", "content": user_text, "msg_id": str(uuid.uuid4())}]
-    ui_messages = [render_message(m) for m in temp_history]
-    
-    logs = format_log(logs, f"Step 1: Routing '{user_text}'")
-    
     try:
+        # Generate ID for User Message
+        temp_history = history + [{"role": "user", "content": user_text, "msg_id": str(uuid.uuid4())}]
+        ui_messages = [render_message(m) for m in temp_history]
+        
+        logs = format_log(logs, f"Step 1: Routing '{user_text}'")
+        
+        # Call Routing Logic
         route_decision = orchestrate_routing(user_text, session_store)
         target_space_id = route_decision.get("target_space_id")
         
@@ -282,7 +301,10 @@ def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
             if target_conv_id:
                 logs = format_log(logs, f"♻️ Reusing Context ID: {target_conv_id}")
 
-        space_label = next((v['label'] for k,v in SPACE_CONFIG.items() if v['id'] == target_space_id), "Unknown")
+        # Label lookup
+        space_label = "Unknown"
+        if SPACE_CONFIG and target_space_id in SPACE_CONFIG:
+             space_label = SPACE_CONFIG[target_space_id].get('label', target_space_id)
         
         trigger_payload = {
             "text": user_text,
@@ -290,16 +312,17 @@ def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
             "conv_id": target_conv_id,
             "space_label": space_label,
             "uuid": str(uuid.uuid4()),
-            "logs": logs
+            "logs": [f"Routing to {space_label}..."] # Pass simplistic logs to avoid serializing complex HTML
         }
         
-        # NOTE: returning logs here is crucial so the user sees "Routing..."
         return ui_messages, "", trigger_payload, logs, f"Routing to {space_label}..."
 
     except Exception as e:
+        # Catch errors so the app doesn't freeze
+        err_msg = traceback.format_exc()
+        print(err_msg)
         logs = format_log(logs, f"ROUTING ERROR: {e}")
-        # Return logs even on error
-        return ui_messages, "", None, logs, "Error"
+        return no_update, no_update, None, logs, "Error in routing."
 
 
 # ==============================================================================
@@ -323,23 +346,25 @@ def step_2_execution(ts, trigger_data, history, session_store, current_ui_logs):
     if not ts or not trigger_data: return no_update
     if history is None: history = []
     if session_store is None: session_store = {}
+    
+    # Re-hydrate logs
     if not isinstance(current_ui_logs, list): current_ui_logs = []
-
-    passed_logs = trigger_data.get("logs", [])
-    for log_text in passed_logs:
-        current_ui_logs.append(create_log_element(log_text))
-
+    
     user_text = trigger_data["text"]
-    current_ui_logs.append(create_log_element(f"Step 2: Calling Genie...", "SYSTEM"))
+    current_ui_logs.append(create_log_element(f"Step 2: Calling Genie ({trigger_data['space_label']})...", "SYSTEM"))
 
+    # Update history with User Message (Source of Truth)
     history.append({"role": "user", "content": user_text, "msg_id": str(uuid.uuid4())})
-    GENIE_USER_TOKEN = flask.request.headers.get('X-Forwarded-Access-Token')
+    
+    # Token Logic: Check Flask headers (Prod) or Env Var (Local)
+    user_token = flask.request.headers.get('X-Forwarded-Access-Token') or GENIE_USER_TOKEN
+    
     try:
         final_conv_id, result, sql = execute_genie_query(
             user_query=user_text,
             space_id=trigger_data["space_id"],
             current_conv_id=trigger_data["conv_id"], 
-            user_token=GENIE_USER_TOKEN,
+            user_token=user_token,
             host=DATABRICKS_HOST
         )
         
@@ -366,15 +391,24 @@ def step_2_execution(ts, trigger_data, history, session_store, current_ui_logs):
         
         active_ui = []
         for sid, data in session_store.items():
-            lbl = next((v['label'] for k,v in SPACE_CONFIG.items() if v['id'] == sid), sid[:5])
-            active_ui.append(html.Div(f"● {lbl}: ...{data['last_topic'][-15:]}", style={"fontSize":"10px"}))
+            # Safe label lookup
+            lbl = sid
+            if SPACE_CONFIG and sid in SPACE_CONFIG:
+                lbl = SPACE_CONFIG[sid].get('label', sid)
+            
+            short_topic = data['last_topic'][:20] + "..." if len(data['last_topic']) > 20 else data['last_topic']
+            active_ui.append(html.Div(f"● {lbl}: {short_topic}", style={"fontSize":"12px", "padding":"2px"}))
 
         return history, ui_messages, session_store, active_ui, current_ui_logs, ""
 
     except Exception as e:
+        print(traceback.format_exc())
         current_ui_logs.append(create_log_element(f"BACKEND ERROR: {e}", "ERROR"))
+        
         history.append({"role": "system", "content": f"Error: {str(e)}", "msg_id": str(uuid.uuid4())})
-        return history, [render_message(m) for m in history], session_store, no_update, current_ui_logs, ""
+        ui_messages = [render_message(m) for m in history]
+        
+        return history, ui_messages, session_store, no_update, current_ui_logs, ""
 
 # --- RESET & SCROLL ---
 @app.callback([Output("chat-history", "data", allow_duplicate=True), Output("chat-window", "children", allow_duplicate=True), Output("session-store", "data", allow_duplicate=True), Output("backend-trigger", "data", allow_duplicate=True)], [Input("reset-btn", "n_clicks")], prevent_initial_call=True)
