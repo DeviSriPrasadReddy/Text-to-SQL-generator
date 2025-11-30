@@ -8,11 +8,10 @@ import os
 import json
 import traceback
 import concurrent.futures
+import hashlib
 from dotenv import load_dotenv
-from io import StringIO
 
 # --- IMPORTS ---
-# Assuming these exist in your project structure
 from routing import SPACE_CONFIG, orchestrate_routing
 from genie_backend import execute_genie_query
 from databricks.sdk import WorkspaceClient
@@ -52,6 +51,9 @@ app.index_string = '''
             details > summary::after { content: " ▼ Show Generated SQL"; }
             details[open] > summary::after { content: " ▲ Hide SQL"; }
             details > pre { background: #2d2d2d; color: #f8f8f2; padding: 10px; border-radius: 5px; margin-top: 5px; font-size: 0.75rem; overflow-x: auto; white-space: pre-wrap; }
+            
+            /* Insight Bubble Style */
+            .insight-bubble { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; padding: 15px; border-radius: 10px; margin-bottom: 10px; width: fit-content; max-width: 85%; margin-left: 0; }
         </style>
     </head>
     <body>
@@ -71,17 +73,15 @@ def run_with_timeout(func, args=(), kwargs=None, timeout_seconds=300):
         except concurrent.futures.TimeoutError:
             raise TimeoutError(f"Process exceeded the {timeout_seconds/60} minute time limit.")
 
-# --- LLM INSIGHTS HELPER (UPDATED) ---
+# --- LLM INSIGHTS HELPER ---
 def generate_llm_insights(df):
     """
-    Accepts a Pandas DataFrame directly.
-    Sends top 50 rows to Databricks Model Serving.
+    Accepts a DataFrame object directly (no deprecated read_json here).
     """
     try:
         w = WorkspaceClient(host=DATABRICKS_HOST, token=GENIE_USER_TOKEN)
         
-        # Convert DF to CSV string for the prompt
-        # We limit to top 50 rows to manage token usage
+        # Convert DF to CSV string for the prompt (Limit to top 50)
         preview_csv = df.head(50).to_csv(index=False)
         
         prompt = f"""
@@ -115,13 +115,11 @@ app.layout = dbc.Container([
     html.Hr(),
     
     dbc.Row([
-        # Sidebar
         dbc.Col([
             dbc.Card([dbc.CardHeader("Active Contexts"), dbc.CardBody(id="active-sessions-list")], className="mb-3"),
             dbc.Button("Reset Chat", id="reset-btn", color="outline-danger", size="sm", className="w-100")
         ], width=3, style={"height": "100%"}),
 
-        # Chat Area
         dbc.Col([
             html.Div([
                 # 1. Chat Window
@@ -165,38 +163,59 @@ def format_log(current_logs, new_entry):
 
 # --- MESSAGE RENDERER ---
 def render_message(msg):
-    is_user = msg["role"] == "user"
-    align = "right" if is_user else "left"
-    bg = "#007bff" if is_user else "#e9ecef"
-    color = "white" if is_user else "black"
-    
-    children = [html.Small(msg.get('space_label', ''), style={"display":"block", "marginBottom":"5px", "color":"#ccc" if is_user else "#666"})]
-    content = msg["content"]
-    msg_type = msg.get("type", "text") # Default to text
-    
-    # Handle Data Tables (Explicit Type Check)
-    if msg_type == "table":
-        try:
-            # Reconstruct DF for Display
-            df = pd.read_json(content, orient='split')
-            children.append(dash_table.DataTable(
-                data=df.to_dict('records'), 
-                columns=[{"name": i, "id": i} for i in df.columns], 
-                style_table={'overflowX': 'auto'}, 
-                style_cell={'textAlign': 'left', 'color': 'black'},
-                page_size=10
-            ))
-        except Exception as e:
-            children.append(html.Div(f"Error rendering table: {str(e)}", style={"color": "red"}))
-    else:
-        # Markdown / Text
-        children.append(dcc.Markdown(str(content)))
-    
-    # SQL Toggle
-    if not is_user and msg.get("sql"):
-        children.append(html.Details([html.Summary(""), html.Pre(msg["sql"])]))
+    """
+    Renders a message object into a Dash Component.
+    Wrapped in try/except to prevent UI blanking on single message failure.
+    """
+    try:
+        is_user = msg["role"] == "user"
+        align = "right" if is_user else "left"
+        bg = "#007bff" if is_user else "#e9ecef"
+        color = "white" if is_user else "black"
         
-    return html.Div(children, style={"textAlign": align, "backgroundColor": bg, "color": color, "padding": "10px", "borderRadius": "10px", "marginBottom": "10px", "marginLeft": "auto" if is_user else "0", "marginRight": "0" if is_user else "auto", "width": "fit-content", "maxWidth": "85%"})
+        children = [html.Small(msg.get('space_label', ''), style={"display":"block", "marginBottom":"5px", "color":"#ccc" if is_user else "#666"})]
+        content = msg["content"]
+        msg_type = msg.get("type", "text") 
+        
+        # Handle Data Tables
+        if msg_type == "table":
+            try:
+                # We need to read the JSON here because it is stored as JSON in dcc.Store
+                df = pd.read_json(content, orient='split')
+                
+                # Create a unique ID for the table to ensure React renders it correctly
+                # Using a simple hash of the first column name + row count
+                table_id = f"table-{hash(str(df.columns))}-{len(df)}"
+                
+                children.append(dash_table.DataTable(
+                    id=table_id,
+                    data=df.to_dict('records'), 
+                    columns=[{"name": i, "id": i} for i in df.columns], 
+                    style_table={'overflowX': 'auto'}, 
+                    style_cell={'textAlign': 'left', 'color': 'black'},
+                    page_size=10
+                ))
+            except Exception as e:
+                children.append(html.Div(f"⚠️ Error displaying table: {str(e)}", style={"color": "red"}))
+        
+        # Handle Insights (Different styling)
+        elif msg_type == "insight":
+             children = [dcc.Markdown(str(content))]
+             bg = "#fff3cd" # Yellowish
+             color = "#856404"
+             
+        else:
+            # Markdown / Text
+            children.append(dcc.Markdown(str(content)))
+        
+        # SQL Toggle
+        if not is_user and msg.get("sql"):
+            children.append(html.Details([html.Summary(""), html.Pre(msg["sql"])]))
+            
+        return html.Div(children, style={"textAlign": align, "backgroundColor": bg, "color": color, "padding": "10px", "borderRadius": "10px", "marginBottom": "10px", "marginLeft": "auto" if is_user else "0", "marginRight": "0" if is_user else "auto", "width": "fit-content", "maxWidth": "85%"})
+
+    except Exception as e:
+        return html.Div(f"System Render Error: {str(e)}", style={"color": "red"})
 
 
 # ==============================================================================
@@ -220,9 +239,12 @@ def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
     if not user_text: return no_update
     if history is None: history = []
     
-    # Update UI immediately
-    temp_history = history + [{"role": "user", "content": user_text, "type": "text"}]
-    ui_messages = [render_message(m) for m in temp_history]
+    # Update UI immediately with "Routing..."
+    # We do NOT save to 'history' store yet, Step 2 will do that.
+    temp_msg = {"role": "user", "content": user_text, "type": "text"}
+    temp_ui_list = history + [temp_msg]
+    ui_messages = [render_message(m) for m in temp_ui_list]
+    
     logs = format_log(logs, f"Step 1: Routing '{user_text}'")
     
     try:
@@ -269,14 +291,16 @@ def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
 )
 def step_2_execution(ts, trigger_data, history, session_store, logs):
     if not ts or not trigger_data: return no_update
+    
+    # Ensure history is a fresh list to avoid state mutation issues
     if history is None: history = []
-    if session_store is None: session_store = {}
+    current_history = list(history) 
 
     user_text = trigger_data["text"]
     logs = format_log(logs, f"Step 2: Executing in {trigger_data['space_id']}...")
 
-    # Add user message to official history
-    history.append({"role": "user", "content": user_text, "type": "text"})
+    # 1. Add User Message to History Store
+    current_history.append({"role": "user", "content": user_text, "type": "text"})
 
     try:
         def run_genie():
@@ -292,17 +316,19 @@ def step_2_execution(ts, trigger_data, history, session_store, logs):
         
         logs = format_log(logs, f"Genie Success. ID: {final_conv_id}")
 
-        # Determine if result is DataFrame or Text
+        # 2. Process Result
         content = result
         msg_type = "text"
         
         if isinstance(result, pd.DataFrame):
+            # We MUST serialize to JSON for dcc.Store
             content = result.to_json(orient='split')
             msg_type = "table"
         elif isinstance(result, str):
             msg_type = "text"
 
-        history.append({
+        # 3. Add Assistant Message to History Store
+        current_history.append({
             "role": "assistant",
             "content": content,
             "type": msg_type,
@@ -312,19 +338,21 @@ def step_2_execution(ts, trigger_data, history, session_store, logs):
 
         session_store[trigger_data["space_id"]] = {"conv_id": final_conv_id, "last_topic": user_text}
 
-        ui_messages = [render_message(m) for m in history]
+        # 4. Render UI
+        ui_messages = [render_message(m) for m in current_history]
         
         active_ui = []
         for sid, data in session_store.items():
             lbl = next((v['label'] for k,v in SPACE_CONFIG.items() if v['id'] == sid), sid[:5])
             active_ui.append(html.Div(f"● {lbl}: ...{data['last_topic'][-15:]}", style={"fontSize":"10px"}))
 
-        return history, ui_messages, session_store, active_ui, logs, ""
+        return current_history, ui_messages, session_store, active_ui, logs, ""
 
     except Exception as e:
         logs = format_log(logs, f"BACKEND ERROR: {e}")
-        history.append({"role": "system", "content": f"Error: {str(e)}", "type": "text"})
-        return history, [render_message(m) for m in history], session_store, no_update, logs, ""
+        err_msg = {"role": "system", "content": f"Error: {str(e)}", "type": "text"}
+        current_history.append(err_msg)
+        return current_history, [render_message(m) for m in current_history], session_store, no_update, logs, ""
 
 
 # ==============================================================================
@@ -357,16 +385,16 @@ def toggle_insight_button(history):
 # ✨ STEP 3: INSIGHT GENERATION
 # ==============================================================================
 @app.callback(
-    [Output("chat-history", "data", allow_duplicate=True),
-     Output("chat-window", "children", allow_duplicate=True),
+    [Output("chat-window", "children", allow_duplicate=True),
      Output("debug-console", "children", allow_duplicate=True),
      Output("typing-indicator", "children", allow_duplicate=True)],
     [Input("insight-btn", "n_clicks")],
     [State("chat-history", "data"),
+     State("chat-window", "children"),
      State("debug-console", "children")],
     prevent_initial_call=True
 )
-def step_3_generate_insights(n_clicks, history, logs):
+def step_3_generate_insights(n_clicks, history, current_ui_children, logs):
     if not n_clicks or not history: return no_update
     
     logs = format_log(logs, "✨ Insight generation triggered...")
@@ -376,37 +404,40 @@ def step_3_generate_insights(n_clicks, history, logs):
 
     if last_assistant_msg.get("type") != "table":
         logs = format_log(logs, "⚠️ Last message was not a dataset.")
-        return no_update, no_update, logs, ""
+        return no_update, logs, ""
 
     content_json = last_assistant_msg.get("content")
 
-    # 2. Call LLM with Timeout
+    # 2. Call LLM
     try:
         logs = format_log(logs, "Deserializing data & sending to LLM...")
         
-        # --- DESERIALIZE JSON TO DATAFRAME HERE ---
-        # This converts the stored JSON string back to a real DataFrame object
+        # Deserialize JSON to DF Object for calculation
         df_obj = pd.read_json(content_json, orient='split')
         
-        # We pass the DataFrame object to the helper, NOT the JSON string
-        insights = run_with_timeout(generate_llm_insights, args=(df_obj,), timeout_seconds=300)
+        # Pass DF object to helper
+        insights_text = run_with_timeout(generate_llm_insights, args=(df_obj,), timeout_seconds=300)
         
-        history.append({
-            "role": "assistant", 
-            "content": f"**✨ AI Insights:**\n\n{insights}",
-            "type": "text",
-            "space_label": "LLM Analysis"
-        })
+        logs = format_log(logs, "Insights generated.")
+
+        # --- KEY CHANGE: DO NOT SAVE TO HISTORY STORE ---
+        # We manually append the insight bubble to the current UI list.
+        # This keeps it visible now, but it will vanish if the user reloads or asks a new question.
+        # This satisfies "if not in context, don't do it [store it]".
         
-        ui_messages = [render_message(m) for m in history]
-        logs = format_log(logs, "Insights generated successfully.")
+        insight_bubble = html.Div([
+            dcc.Markdown(f"**✨ AI Insights:**\n\n{insights_text}")
+        ], className="insight-bubble", style={"marginLeft": "auto" if False else "0"})
         
-        return history, ui_messages, logs, ""
+        # Append to existing UI components
+        if not isinstance(current_ui_children, list): current_ui_children = []
+        updated_ui = current_ui_children + [insight_bubble]
+        
+        return updated_ui, logs, ""
         
     except Exception as e:
         logs = format_log(logs, f"LLM ERROR: {e}")
-        history.append({"role": "system", "content": f"Error generating insights: {str(e)}", "type": "text"})
-        return history, [render_message(m) for m in history], logs, ""
+        return no_update, logs, ""
 
 
 # --- RESET ---
