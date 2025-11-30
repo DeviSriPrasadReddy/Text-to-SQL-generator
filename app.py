@@ -8,31 +8,29 @@ import os
 import traceback
 import json
 import flask
+import concurrent.futures
+from dotenv import load_dotenv
 
-# --- DATABRICKS IMPORTS ---
+# --- IMPORTS FROM YOUR LOCAL FILES ---
+# These must exist in the same directory
+from route import SPACE_CONFIG, orchestrate_routing
+from genie_backend import execute_genie_query
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.serving import ChatMessage, ChatMessageRole
 
-# --- LOCAL MODULE IMPORTS ---
-# We wrap this in try/except to prevent the app from crashing if these files are missing
-try:
-    from route import SPACE_CONFIG, orchestrate_routing
-    from genie_backend import execute_genie_query
-except ImportError as e:
-    print(f"⚠️ WARNING: Local modules not found ({e}). Using MOCK mode.")
-    SPACE_CONFIG = {"1": {"id": "1", "label": "Finance"}, "2": {"id": "2", "label": "HR"}}
-    def orchestrate_routing(text, store): return {"target_space_id": "1"}
-    def execute_genie_query(**kwargs): return "123", pd.DataFrame({"Mock Column": ["Data A", "Data B"]}), "SELECT * FROM mock_table"
+load_dotenv()
 
 # --- CONFIGURATION ---
 DATABRICKS_HOST = os.environ.get("DATABRICKS_HOST")
-GENIE_USER_TOKEN = os.environ.get("DATABRICKS_TOKEN")
+# Fallback to local env var if header is missing (for local testing)
+GENIE_USER_TOKEN = os.environ.get("DATABRICKS_TOKEN") 
 LLM_ENDPOINT_URL = os.environ.get("SERVING_ENDPOINT_NAME")
+TIMEOUT_SECONDS = 180  # 3 Minutes
 
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP, dbc.icons.BOOTSTRAP], title="Genie Router")
 server = app.server
 
-# --- CSS ---
+# --- CSS STYLING ---
 app.index_string = '''
 <!DOCTYPE html>
 <html>
@@ -42,13 +40,20 @@ app.index_string = '''
         {%favicon%}
         {%css%}
         <style>
-            .chat-container { height: 70vh; }
-            .chat-col-wrapper { height: 100%; display: flex; flex-direction: column; }
+            .chat-container { height: 80vh; display: flex; flex-direction: column; }
             .chat-window { flex-grow: 1; overflow-y: auto; padding: 20px; background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 5px; }
-            .debug-terminal { background-color: #1e1e1e; color: #00ff00; font-family: 'Courier New', monospace; font-size: 0.8rem; padding: 15px; height: 200px; overflow-y: auto; border-radius: 5px; white-space: pre-wrap; }
-            .user-message { background-color: #007bff; color: white; align-self: flex-end; margin-left: auto; border-radius: 10px 10px 0 10px; }
-            .bot-message { background-color: #ffffff; color: #333; align-self: flex-start; margin-right: auto; border: 1px solid #e5e7eb; border-radius: 10px 10px 10px 0; box-shadow: 0 1px 2px rgba(0,0,0,0.05); }
-            details > summary { cursor: pointer; color: #6c757d; font-size: 0.75rem; margin-top: 8px; outline: none; }
+            .debug-terminal { background-color: #1e1e1e; color: #00ff00; font-family: 'Courier New', monospace; font-size: 0.8rem; padding: 15px; height: 150px; overflow-y: auto; border-radius: 5px; white-space: pre-wrap; }
+            
+            /* Message Bubbles */
+            .user-message { background-color: #007bff; color: white; align-self: flex-end; margin-left: auto; border-radius: 10px 10px 0 10px; max-width: 85%; width: fit-content; }
+            .bot-message { background-color: #ffffff; color: #333; align-self: flex-start; margin-right: auto; border: 1px solid #e5e7eb; border-radius: 10px 10px 10px 0; box-shadow: 0 1px 2px rgba(0,0,0,0.05); max-width: 90%; width: fit-content; }
+            .error-message { background-color: #fee2e2; color: #991b1b; border: 1px solid #f87171; border-radius: 8px; padding: 10px; margin-bottom: 10px; width: fit-content; }
+            
+            /* SQL Toggle */
+            details > summary { cursor: pointer; color: #6c757d; font-size: 0.75rem; margin-top: 8px; outline: none; list-style: none; }
+            details > summary::-webkit-details-marker { display: none; }
+            details > summary::after { content: " ▼ Show SQL"; }
+            details[open] > summary::after { content: " ▲ Hide SQL"; }
             details > pre { background: #2d2d2d; color: #f8f8f2; padding: 10px; border-radius: 5px; margin-top: 5px; font-size: 0.75rem; overflow-x: auto; white-space: pre-wrap; }
         </style>
     </head>
@@ -63,16 +68,25 @@ app.index_string = '''
 app.layout = dbc.Container([
     dbc.Row([
         dbc.Col(html.H3("🧞 Genie Super-Router"), width=8, className="mt-3"),
-        dbc.Col(html.Div(id="status-indicator", className="mt-4 text-muted"), width=4)
+        dbc.Col(html.Div(id="status-indicator", className="mt-4 text-end text-muted small"), width=4)
     ]),
     html.Hr(),
     
     dbc.Row([
+        # Sidebar
         dbc.Col([
-            dbc.Card([dbc.CardHeader("Active Contexts"), dbc.CardBody(id="active-sessions-list")], className="mb-3"),
-            dbc.Button("Reset Chat", id="reset-btn", color="outline-danger", size="sm", className="w-100")
-        ], width=3, style={"height": "100%"}),
+            dbc.Card([
+                dbc.CardHeader("Active Contexts"), 
+                dbc.CardBody(id="active-sessions-list", className="p-2 small")
+            ], className="mb-3"),
+            dbc.Button("🗑️ Reset Chat", id="reset-btn", color="outline-danger", size="sm", className="w-100 mb-2"),
+            dbc.Collapse(
+                dbc.Card([dbc.CardHeader("🐞 Log"), dbc.CardBody(html.Div(id="debug-console", className="debug-terminal"))]),
+                id="debug-collapse", is_open=True
+            ),
+        ], width=3),
 
+        # Chat Area
         dbc.Col([
             html.Div([
                 html.Div(id="chat-window", className="chat-window"),
@@ -83,16 +97,11 @@ app.layout = dbc.Container([
                     ], className="mt-3"),
                     html.Div(id="typing-indicator", className="text-muted small mt-1", style={"minHeight": "20px"})
                 ])
-            ], className="chat-col-wrapper")
-        ], width=9, style={"height": "100%"})
-    ], className="chat-container mb-3"),
+            ], className="chat-container")
+        ], width=9)
+    ], className="mb-3"),
 
-    dbc.Collapse(
-        dbc.Card([dbc.CardHeader("🐞 Logic Log"), dbc.CardBody(html.Div(id="debug-console", className="debug-terminal"))]),
-        id="debug-collapse", is_open=True
-    ),
-
-    # Storage
+    # State Management
     dcc.Store(id="chat-history", data=[]),
     dcc.Store(id="session-store", data={}), 
     dcc.Store(id="backend-trigger", data=None),
@@ -104,32 +113,70 @@ app.layout = dbc.Container([
 # --- HELPER FUNCTIONS ---
 def create_log_element(text, level="INFO"):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
-    css = "text-danger" if level == "ERROR" else "text-info" if level == "SYSTEM" else ""
-    return html.Div([html.Span(f"[{ts}] ", className="text-muted mr-2"), html.Span(f"[{level}] ", className=css), html.Span(str(text))])
+    return f"[{ts}] [{level}] {text}"
 
 def render_message(msg):
-    is_user = msg["role"] == "user"
+    role = msg.get("role")
     msg_id = msg.get("msg_id", str(uuid.uuid4()))
-    css_class = "user-message" if is_user else "bot-message"
-    align = "right" if is_user else "left"
     
-    children = [html.Small(msg.get('space_label', ''), style={"display":"block", "marginBottom":"5px", "color":"#ddd" if is_user else "#666", "fontWeight":"bold"})]
-    content = msg["content"]
-    
-    if isinstance(content, str) and content.startswith('{') and "columns" in content:
-        try:
-            df = pd.read_json(content, orient='split')
-            children.append(html.Div([dbc.Button("⬇️ CSV", id={'type': 'download-btn', 'index': msg_id}, size="sm", color="light", className="mb-2", style={"fontSize": "0.7rem"})], style={"textAlign": "right"}))
-            children.append(dash_table.DataTable(data=df.to_dict('records'), columns=[{"name": i, "id": i} for i in df.columns], style_table={'overflowX': 'auto'}, page_size=5))
-            children.append(html.Div([dbc.Button("✨ Insights", id={'type': 'insight-btn', 'index': msg_id}, size="sm", color="success", outline=True, className="mt-2"), html.Div(id={'type': 'insight-output', 'index': msg_id})]))
-        except: children.append(html.Div(str(content)))
-    else:
-        children.append(dcc.Markdown(str(content)))
-    
-    if not is_user and msg.get("sql"):
-        children.append(html.Details([html.Summary("View SQL"), html.Pre(msg["sql"])]))
+    if role == "user":
+        return html.Div([
+            html.Small("You", className="fw-bold text-light mb-1 d-block"),
+            html.Div(msg["content"])
+        ], className="p-3 user-message mb-3")
         
-    return html.Div(children, className=f"p-3 {css_class}", style={"textAlign": align, "marginBottom": "15px", "maxWidth": "85%", "width": "fit-content", "marginLeft": "auto" if is_user else "0"})
+    elif role == "error":
+        return html.Div([
+            html.Strong("⚠️ System Error"),
+            html.Div(msg["content"])
+        ], className="error-message mb-3")
+        
+    else: # Assistant/Bot
+        children = [html.Small(f"Genie ({msg.get('space_label', 'Bot')})", className="fw-bold text-muted mb-1 d-block")]
+        content = msg["content"]
+        
+        # DataFrame Rendering
+        if isinstance(content, str) and content.startswith('{') and "columns" in content:
+            try:
+                df = pd.read_json(content, orient='split')
+                children.append(html.Div([
+                    dbc.Button("⬇️ CSV", id={'type': 'download-btn', 'index': msg_id}, size="sm", color="light", className="mb-2", style={"fontSize": "0.7rem"}),
+                    dash_table.DataTable(
+                        data=df.to_dict('records'), 
+                        columns=[{"name": i, "id": i} for i in df.columns],
+                        style_table={'overflowX': 'auto'},
+                        style_cell={'textAlign': 'left', 'fontFamily': 'sans-serif', 'padding': '5px'},
+                        page_size=5
+                    ),
+                    dbc.Button("✨ AI Insights", id={'type': 'insight-btn', 'index': msg_id}, size="sm", color="success", outline=True, className="mt-2"),
+                    html.Div(id={'type': 'insight-output', 'index': msg_id})
+                ]))
+            except:
+                children.append(html.Div(str(content)))
+        else:
+            children.append(dcc.Markdown(str(content)))
+            
+        if msg.get("sql"):
+            children.append(html.Details([html.Summary("View SQL"), html.Pre(msg["sql"])]))
+            
+        return html.Div(children, className="p-3 bot-message mb-3")
+
+# --- INSIGHTS GENERATION (Uses Databricks LLM) ---
+def generate_data_insights(df: pd.DataFrame) -> str:
+    if df.empty: return "No data available."
+    try:
+        stats = df.describe().to_markdown()
+        sample = df.head(3).to_markdown(index=False)
+        prompt = f"Analyze this data snippet:\nMETADATA: {list(df.columns)}\nSTATS:\n{stats}\nSAMPLE:\n{sample}\nProvide 3 concise insights."
+        
+        client = WorkspaceClient()
+        response = client.serving_endpoints.query(
+            name=LLM_ENDPOINT_URL,
+            messages=[ChatMessage(content=prompt, role=ChatMessageRole.USER)],
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Insight generation failed: {str(e)}"
 
 # ==============================================================================
 # 🔄 STEP 1: ROUTING (UI TRIGGER)
@@ -149,44 +196,53 @@ def render_message(msg):
     prevent_initial_call=True
 )
 def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
-    print(f"DEBUG: Step 1 triggered. Text: {user_text}") # CHECK YOUR TERMINAL FOR THIS
-    
     if not user_text: return no_update
     if history is None: history = []
     if not isinstance(logs, list): logs = []
-
-    # 1. Update UI immediately
-    new_msg_id = str(uuid.uuid4())
-    temp_history = history + [{"role": "user", "content": user_text, "msg_id": new_msg_id}]
-    ui_messages = [render_message(m) for m in temp_history]
     
-    logs.append(create_log_element(f"Step 1: Routing '{user_text}'..."))
-
-    # 2. Logic
+    # 1. Update UI immediately with User Message
+    msg_id = str(uuid.uuid4())
+    history.append({"role": "user", "content": user_text, "msg_id": msg_id})
+    ui_messages = [render_message(m) for m in history]
+    
+    logs.append(create_log_element(f"User: {user_text}"))
+    
+    # 2. Routing Logic
     try:
         route_decision = orchestrate_routing(user_text, session_store)
         target_space_id = route_decision.get("target_space_id")
-        target_conv_id = session_store.get(target_space_id, {}).get("conv_id")
         
-        space_label = SPACE_CONFIG.get(target_space_id, {}).get('label', target_space_id)
+        # Retrieve existing conversation ID if available
+        target_conv_id = None
+        if target_space_id in session_store:
+            target_conv_id = session_store[target_space_id].get("conv_id")
+
+        # Get readable label
+        space_label = "Unknown"
+        if SPACE_CONFIG and target_space_id in SPACE_CONFIG:
+             space_label = SPACE_CONFIG[target_space_id].get('label', target_space_id)
         
+        logs.append(create_log_element(f"Routed to: {space_label} (ID: {target_space_id})"))
+        
+        # Prepare trigger for Step 2
         trigger_payload = {
             "text": user_text,
             "space_id": target_space_id,
             "conv_id": target_conv_id,
             "space_label": space_label,
-            "uuid": str(uuid.uuid4()),
-            "log_msg": f"Routing to {space_label}..." 
+            "uuid": msg_id
         }
         
-        return ui_messages, "", trigger_payload, logs, f"Thinking in {space_label}..."
+        return ui_messages, "", trigger_payload, "\n".join(logs), f"Genie is thinking in {space_label}..."
+
     except Exception as e:
         traceback.print_exc()
-        logs.append(create_log_element(f"ROUTING ERROR: {e}", "ERROR"))
-        return ui_messages, "", None, logs, "Error."
+        logs.append(create_log_element(f"Routing Error: {e}", "ERROR"))
+        return ui_messages, "", None, "\n".join(logs), "Routing Error."
+
 
 # ==============================================================================
-# ⚙️ STEP 2: EXECUTION (BACKEND TRIGGER)
+# ⚙️ STEP 2: EXECUTION (WITH TIMEOUT)
 # ==============================================================================
 @app.callback(
     [Output("chat-history", "data", allow_duplicate=True),
@@ -201,61 +257,84 @@ def step_1_routing(n_c, n_s, user_text, history, session_store, logs):
      State("debug-console", "children")],
     prevent_initial_call=True
 )
-def step_2_execution(trigger_data, history, session_store, logs):
+def step_2_execution(trigger_data, history, session_store, logs_str):
     if not trigger_data: return no_update
-    print(f"DEBUG: Step 2 triggered for {trigger_data.get('space_label')}")
     
-    if history is None: history = []
-    if session_store is None: session_store = {}
-    if not isinstance(logs, list): logs = []
+    # Rehydrate logs
+    logs = [logs_str] if logs_str else []
+    logs.append(create_log_element(f"Executing Query (Timeout: {TIMEOUT_SECONDS}s)..."))
 
-    user_text = trigger_data["text"]
-    logs.append(create_log_element(trigger_data.get("log_msg", "Processing..."), "SYSTEM"))
+    # Determine Token (Headers for Prod, Env for Local)
+    user_token = flask.request.headers.get('X-Forwarded-Access-Token') or GENIE_USER_TOKEN
 
-    # Add User Msg to History (Source of Truth)
-    history.append({"role": "user", "content": user_text, "msg_id": str(uuid.uuid4())})
-    
-    # Exec Backend
-    try:
-        user_token = flask.request.headers.get('X-Forwarded-Access-Token') or GENIE_USER_TOKEN
-        
-        final_conv_id, result, sql = execute_genie_query(
-            user_query=user_text,
+    # --- WRAPPER FOR TIMEOUT ---
+    def run_genie_process():
+        return execute_genie_query(
+            user_query=trigger_data["text"],
             space_id=trigger_data["space_id"],
             current_conv_id=trigger_data["conv_id"], 
             user_token=user_token,
             host=DATABRICKS_HOST
         )
 
-        # Process Result
-        content = result.to_json(orient='split') if isinstance(result, pd.DataFrame) else str(result)
-        logs.append(create_log_element("✅ Response received.", "SYSTEM"))
+    try:
+        # Execute with ThreadPool to enable Timeout
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(run_genie_process)
+            
+            try:
+                # WAIT FOR RESULT OR TIMEOUT
+                final_conv_id, result, sql = future.result(timeout=TIMEOUT_SECONDS)
+                
+                # --- SUCCESS PATH ---
+                logs.append(create_log_element("✅ Backend returned data."))
+                
+                # Serialize Data
+                content_to_store = "No content."
+                if isinstance(result, pd.DataFrame):
+                    content_to_store = result.to_json(orient='split', date_format='iso') if not result.empty else "**No data found.**"
+                else:
+                    content_to_store = str(result)
 
-        history.append({
-            "role": "assistant",
-            "content": content,
-            "space_label": trigger_data["space_label"],
-            "sql": sql,
-            "msg_id": str(uuid.uuid4())
-        })
+                history.append({
+                    "role": "assistant",
+                    "content": content_to_store,
+                    "space_label": trigger_data["space_label"],
+                    "sql": sql,
+                    "msg_id": str(uuid.uuid4())
+                })
 
-        # Update Session
-        session_store[trigger_data["space_id"]] = {"conv_id": final_conv_id, "last_topic": user_text}
+                # Update Session
+                session_store[trigger_data["space_id"]] = {"conv_id": final_conv_id, "last_topic": trigger_data["text"]}
 
-        # Render
+            except concurrent.futures.TimeoutError:
+                # --- TIMEOUT PATH ---
+                logs.append(create_log_element("❌ TIMEOUT REACHED.", "ERROR"))
+                history.append({
+                    "role": "error",
+                    "content": f"⏱️ **Request Timed Out**\n\nThe query took longer than {TIMEOUT_SECONDS} seconds. This usually happens if the Genie space is cold or the query is too complex.\n\nPlease try again in a moment.",
+                    "msg_id": str(uuid.uuid4())
+                })
+
+        # Render UI
         ui_messages = [render_message(m) for m in history]
-        active_ui = [html.Div(f"● {k}: Active", style={"fontSize":"12px"}) for k in session_store.keys()]
+        
+        # Update Sidebar
+        active_ui = []
+        for sid, data in session_store.items():
+            lbl = SPACE_CONFIG.get(sid, {}).get('label', sid) if SPACE_CONFIG else sid
+            active_ui.append(html.Div(f"● {lbl}", style={"fontSize":"12px", "color":"green"}))
 
-        return history, ui_messages, session_store, active_ui, logs, ""
+        return history, ui_messages, session_store, active_ui, "\n".join(logs), ""
 
     except Exception as e:
         traceback.print_exc()
-        logs.append(create_log_element(f"BACKEND ERROR: {e}", "ERROR"))
-        history.append({"role": "system", "content": f"Error: {e}"})
-        return history, [render_message(m) for m in history], session_store, no_update, logs, ""
+        logs.append(create_log_element(f"CRITICAL ERROR: {e}", "ERROR"))
+        history.append({"role": "error", "content": f"System Error: {str(e)}"})
+        return history, [render_message(m) for m in history], session_store, no_update, "\n".join(logs), ""
 
 # ==============================================================================
-# 🧹 RESET & CSV & INSIGHTS
+# 🧹 UTILITIES (Reset, Download, Insights)
 # ==============================================================================
 @app.callback(
     [Output("chat-history", "data", allow_duplicate=True),
@@ -266,7 +345,6 @@ def step_2_execution(trigger_data, history, session_store, logs):
     prevent_initial_call=True
 )
 def reset_app(n):
-    if not n: return no_update
     return [], [], {}, None
 
 @app.callback(
@@ -278,10 +356,13 @@ def reset_app(n):
 def download_csv(n, history):
     if not n: return no_update
     ctx = callback_context
-    target = ctx.triggered_id['index']
-    for m in history:
-        if m.get("msg_id") == target:
-            return dcc.send_data_frame(pd.read_json(m["content"], orient='split').to_csv, "data.csv")
+    target_id = ctx.triggered_id['index']
+    for msg in history:
+        if msg.get("msg_id") == target_id:
+            try:
+                df = pd.read_json(msg["content"], orient='split')
+                return dcc.send_data_frame(df.to_csv, "genie_data.csv")
+            except: pass
     return no_update
 
 @app.callback(
@@ -290,13 +371,29 @@ def download_csv(n, history):
     State("chat-history", "data"),
     prevent_initial_call=True
 )
-def insight_action(n, history):
+def insights_action(n, history):
     if not n: return no_update
-    return html.Div("Insight generation triggered (add logic here).", className="text-success small")
+    ctx = callback_context
+    target_id = ctx.triggered_id['index']
+    for msg in history:
+        if msg.get("msg_id") == target_id:
+            try:
+                df = pd.read_json(msg["content"], orient='split')
+                insights = generate_data_insights(df)
+                return html.Div([html.Strong("✨ AI Analysis:"), dcc.Markdown(insights)], className="alert alert-success mt-2 small")
+            except Exception as e:
+                return html.Div(f"Error: {e}", className="text-danger small")
+    return no_update
 
-# Auto-scroll
+# Auto-scroll Logic
 app.clientside_callback(
-    """function(children) { var w = document.getElementById('chat-window'); if(w){ setTimeout(function(){ w.scrollTop = w.scrollHeight; }, 100); } return null; }""",
+    """function(children) { 
+        var chat_window = document.getElementById('chat-window'); 
+        if(chat_window) { 
+            setTimeout(function() { chat_window.scrollTop = chat_window.scrollHeight; }, 100); 
+        } 
+        return null; 
+    }""",
     Output("dummy-scroll-target", "children"),
     Input("chat-window", "children")
 )
